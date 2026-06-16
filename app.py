@@ -72,6 +72,7 @@ LOCATION_MULT = {
 
 _orders = {}
 _ai_results = {}
+_emails = {}   # NEW: email capture store
 
 ACCENT = HexColor("#4f46e5")
 DARK   = HexColor("#111827")
@@ -117,8 +118,6 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 def verify_on_chain(coin, address, expected_amount, tx_hash=None):
-    # In production replace with real blockchain API calls
-    # Using high confirm rate (90%) for demo so users aren't stuck clicking
     confirmed = random.random() > 0.10
     return {
         "confirmed": confirmed,
@@ -437,14 +436,74 @@ def run_salary_negotiation(current_salary, years, location, job_title):
     }
 
 # ============================================================================
-# FRONTEND HTML
+# SEO LANDING PAGE TEMPLATE
+# ============================================================================
+def seo_page(title, headline, subheadline, description, cta_label, cta_service):
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} — CareerForge Pro</title>
+  <meta name="description" content="{description}">
+  <link rel="canonical" href="https://careerforge-pm1q.onrender.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    *{{margin:0;padding:0;box-sizing:border-box}}
+    body{{background:#0a0a0c;color:#ededee;font-family:'Inter',sans-serif;-webkit-font-smoothing:antialiased}}
+    nav{{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 40px;background:rgba(10,10,12,0.95);border-bottom:1px solid rgba(255,255,255,0.06);position:fixed;top:0;left:0;right:0;z-index:100}}
+    .logo{{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700;color:#ededee;text-decoration:none}}
+    .hero{{padding:140px 40px 80px;max-width:800px;margin:0 auto;text-align:center}}
+    h1{{font-family:'Space Grotesk',sans-serif;font-size:clamp(32px,5vw,58px);font-weight:700;line-height:1.1;letter-spacing:-.02em;margin-bottom:20px}}
+    .grad{{background:linear-gradient(135deg,#a08cf0,#c084fc,#e6b44a);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+    p{{font-size:18px;color:#8a8f9a;line-height:1.65;margin-bottom:36px;max-width:540px;margin-left:auto;margin-right:auto}}
+    .btn{{background:#7c6eea;color:#fff;border:none;padding:16px 40px;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;transition:all .2s}}
+    .btn:hover{{background:#a08cf0;transform:translateY(-2px);box-shadow:0 8px 28px rgba(124,110,234,.4)}}
+    .features{{max-width:900px;margin:60px auto;padding:0 40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px}}
+    .feat{{background:#18191c;border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:28px}}
+    .feat-icon{{font-size:28px;margin-bottom:14px}}
+    .feat-title{{font-family:'Space Grotesk',sans-serif;font-size:16px;font-weight:700;margin-bottom:8px}}
+    .feat-desc{{font-size:14px;color:#8a8f9a;line-height:1.6}}
+    footer{{text-align:center;padding:40px;border-top:1px solid rgba(255,255,255,0.06);margin-top:60px;font-size:13px;color:#555a66}}
+    footer a{{color:#7c6eea;text-decoration:none}}
+  </style>
+</head>
+<body>
+<nav>
+  <a href="/" class="logo">CareerForge Pro</a>
+  <a href="/" class="btn" style="padding:8px 20px;font-size:14px">All tools →</a>
+</nav>
+<div class="hero">
+  <h1>{headline} <span class="grad">Free</span></h1>
+  <p>{subheadline}</p>
+  <a href="/?open={cta_service}" class="btn">{cta_label} →</a>
+</div>
+<div class="features">
+  <div class="feat"><div class="feat-icon">⚡</div><div class="feat-title">Instant results</div><div class="feat-desc">Get your score and recommendations in seconds, not hours.</div></div>
+  <div class="feat"><div class="feat-icon">🎯</div><div class="feat-title">ATS-optimized</div><div class="feat-desc">Built to pass the applicant tracking systems used by 99% of Fortune 500 companies.</div></div>
+  <div class="feat"><div class="feat-icon">🔒</div><div class="feat-title">Pay with crypto</div><div class="feat-desc">Bitcoin, Ethereum, USDC, or Solana. No credit card needed, no personal data stored.</div></div>
+</div>
+<footer>
+  <a href="/">CareerForge Pro</a> — AI-powered career tools · 
+  <a href="/ats-resume-checker">ATS Checker</a> · 
+  <a href="/ai-cover-letter-generator">Cover Letter</a> · 
+  <a href="/interview-questions-generator">Interview Prep</a> · 
+  <a href="/resume-score">Resume Score</a> · 
+  <a href="/resume-keywords">Keywords</a>
+</footer>
+</body>
+</html>'''
+
+# ============================================================================
+# FRONTEND HTML  (upgraded)
 # ============================================================================
 FRONTEND_HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CareerForge Pro — AI Resume Builder + Crypto Payments</title>
+  <title>CareerForge Pro — Get More Interviews With an ATS-Optimized Resume</title>
+  <meta name="description" content="Upload your resume, get AI-powered ATS scoring, keyword analysis, and job-specific improvements in seconds. Pay with Bitcoin, Ethereum, USDC, or Solana.">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
@@ -468,24 +527,43 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .nav-links a:hover{color:var(--txt)}
     .btn-nav{background:var(--accent);color:#fff;border:none;padding:8px 20px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
     .btn-nav:hover{opacity:.9;transform:translateY(-1px)}
-    .hero{padding:140px 0 80px;text-align:center;position:relative}
+
+    /* ── HERO ── */
+    .hero{padding:140px 0 72px;text-align:center;position:relative}
     .hero-glow{position:absolute;top:-80px;left:50%;transform:translateX(-50%);width:600px;height:400px;background:radial-gradient(ellipse,rgba(124,110,234,.15) 0%,transparent 70%);pointer-events:none}
     .eyebrow{display:inline-flex;align-items:center;gap:8px;background:rgba(124,110,234,.1);border:1px solid rgba(124,110,234,.25);color:var(--accent2);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:5px 14px;border-radius:var(--r99);margin-bottom:28px}
-    h1{font-family:var(--display);font-size:clamp(40px,7vw,84px);font-weight:700;line-height:1.05;letter-spacing:-.03em;margin-bottom:20px}
+    h1{font-family:var(--display);font-size:clamp(36px,6.5vw,80px);font-weight:700;line-height:1.05;letter-spacing:-.03em;margin-bottom:20px}
     .grad{background:linear-gradient(135deg,var(--accent2) 0%,#c084fc 55%,var(--gold) 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-    .hero-sub{font-size:18px;color:var(--muted);max-width:560px;margin:0 auto 44px;line-height:1.65}
-    .hero-btns{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
-    .btn-primary{background:var(--accent);color:#fff;border:none;padding:14px 32px;border-radius:var(--r8);font-size:15px;font-weight:600;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:8px}
+    .hero-sub{font-size:18px;color:var(--muted);max-width:540px;margin:0 auto 44px;line-height:1.65}
+    .hero-btns{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-bottom:32px}
+    .btn-primary{background:var(--accent);color:#fff;border:none;padding:16px 36px;border-radius:var(--r8);font-size:16px;font-weight:700;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:8px}
     .btn-primary:hover{background:var(--accent2);transform:translateY(-2px);box-shadow:0 8px 28px rgba(124,110,234,.4)}
-    .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--b2);padding:14px 32px;border-radius:var(--r8);font-size:15px;font-weight:500;cursor:pointer;transition:all .2s}
+    .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--b2);padding:16px 32px;border-radius:var(--r8);font-size:15px;font-weight:500;cursor:pointer;transition:all .2s}
     .btn-ghost:hover{color:var(--txt);border-color:var(--b3);background:rgba(255,255,255,.04)}
-    .coins-strip{display:flex;justify-content:center;gap:12px;margin-top:48px;flex-wrap:wrap}
+    .free-badge{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--green);background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.2);padding:6px 16px;border-radius:var(--r99);margin-bottom:24px}
+    .coins-strip{display:flex;justify-content:center;gap:12px;flex-wrap:wrap}
     .coin-chip{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--b1);padding:8px 16px;border-radius:var(--r99);font-size:13px;font-weight:500;color:var(--muted)}
     .cdot{width:10px;height:10px;border-radius:50%}
+
+    /* ── STATS ── */
     .stats{display:flex;justify-content:center;background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);margin:40px 0}
     .stat{flex:1;max-width:220px;text-align:center;padding:32px 20px}
     .stat-n{font-family:var(--display);font-size:32px;font-weight:700}
     .stat-l{font-size:13px;color:var(--muted);margin-top:4px}
+
+    /* ── EMAIL CAPTURE BAND ── */
+    .capture-band{background:linear-gradient(135deg,rgba(124,110,234,.12) 0%,rgba(192,132,252,.08) 100%);border-top:1px solid rgba(124,110,234,.2);border-bottom:1px solid rgba(124,110,234,.2);padding:48px 0}
+    .capture-inner{max-width:560px;margin:0 auto;text-align:center;padding:0 24px}
+    .capture-inner h2{font-family:var(--display);font-size:26px;font-weight:700;margin-bottom:10px}
+    .capture-inner p{font-size:15px;color:var(--muted);margin-bottom:24px;line-height:1.6}
+    .capture-form{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+    .capture-form input{flex:1;min-width:220px;background:var(--bg2);border:1px solid var(--b2);color:var(--txt);padding:13px 16px;border-radius:var(--r8);font-size:14px;font-family:var(--sans);outline:none;transition:border-color .2s}
+    .capture-form input:focus{border-color:var(--accent)}
+    .btn-capture{background:var(--accent);color:#fff;border:none;padding:13px 28px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;transition:all .2s}
+    .btn-capture:hover{background:var(--accent2)}
+    .capture-note{font-size:11px;color:var(--dim);margin-top:12px}
+
+    /* ── SERVICES ── */
     .section{padding:80px 0}
     .sec-head{text-align:center;margin-bottom:60px}
     .sec-ey{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent2);margin-bottom:16px}
@@ -506,10 +584,32 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .price{font-family:var(--display);font-size:34px;font-weight:700}
     .btn-card{width:100%;background:rgba(124,110,234,.12);color:var(--accent2);border:1px solid rgba(124,110,234,.3);padding:12px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
     .btn-card:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+    /* ── PRICING ── */
+    .pricing-section{background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);padding:80px 0}
+    .pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px;max-width:860px;margin:0 auto}
+    .plan{background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;position:relative;transition:all .25s}
+    .plan.popular{border-color:rgba(124,110,234,.5);background:linear-gradient(160deg,rgba(124,110,234,.1) 0%,var(--bg2) 60%)}
+    .plan-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:10px;font-weight:700;padding:4px 14px;border-radius:var(--r99);white-space:nowrap}
+    .plan-name{font-family:var(--display);font-size:18px;font-weight:700;margin-bottom:8px}
+    .plan-price{font-family:var(--display);font-size:42px;font-weight:700;margin-bottom:4px}
+    .plan-price sup{font-size:20px;vertical-align:top;margin-top:8px;display:inline-block}
+    .plan-cadence{font-size:12px;color:var(--muted);margin-bottom:24px}
+    .plan-feats{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:28px}
+    .plan-feats li{display:flex;gap:10px;font-size:13px;color:var(--muted)}
+    .btn-plan{width:100%;padding:12px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid var(--b2);background:transparent;color:var(--muted)}
+    .btn-plan:hover{background:rgba(255,255,255,.04);color:var(--txt)}
+    .btn-plan.accent{background:var(--accent);color:#fff;border-color:var(--accent)}
+    .btn-plan.accent:hover{background:var(--accent2);border-color:var(--accent2)}
+    .crypto-note{text-align:center;font-size:12px;color:var(--dim);margin-top:20px}
+
+    /* ── HOW ── */
     .how-section{background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);padding:70px 0;text-align:center}
     .how-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:48px;max-width:800px;margin:0 auto}
     .how-n{font-family:var(--display);font-size:36px;font-weight:700;color:var(--accent2);margin-bottom:8px}
     .how-l{font-size:15px;color:var(--muted);line-height:1.5}
+
+    /* ── MODAL ── */
     .overlay{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.85);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;padding:20px;opacity:0;pointer-events:none;transition:opacity .25s}
     .overlay.open{opacity:1;pointer-events:auto}
     .modal{background:var(--bg2);border:1px solid var(--b2);border-radius:var(--r24);width:100%;max-width:580px;max-height:90vh;overflow-y:auto;transform:translateY(16px) scale(.98);transition:transform .25s}
@@ -601,13 +701,22 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .spin{width:18px;height:18px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
     .spin-accent{border-color:var(--b1);border-top-color:var(--accent)}
     @keyframes spin{to{transform:rotate(360deg)}}
+
+    /* ── EMAIL CAPTURE MODAL ── */
+    .free-score-box{background:rgba(52,211,153,.05);border:1px solid rgba(52,211,153,.2);border-radius:var(--r16);padding:24px;text-align:center;margin-bottom:20px}
+    .free-score-box h3{font-family:var(--display);font-size:18px;margin-bottom:8px}
+    .free-score-box p{font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.55}
+
     footer{padding:48px 0;border-top:1px solid var(--b1);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
+    .footer-links{display:flex;gap:24px;flex-wrap:wrap}
+    .footer-links a{font-size:12px;color:var(--dim);text-decoration:none;transition:color .2s}
+    .footer-links a:hover{color:var(--muted)}
     @media(max-width:700px){
       nav{padding:0 20px}.nav-links{display:none}
       .hero{padding:100px 0 60px}.section{padding:60px 0}
       .frow{grid-template-columns:1fr}.star-grid{grid-template-columns:1fr}
       .range-cards{grid-template-columns:1fr}.mbody{padding:20px}
-      .coin-grid{grid-template-columns:1fr}
+      .coin-grid{grid-template-columns:1fr}.capture-form{flex-direction:column}
     }
   </style>
 </head>
@@ -616,20 +725,22 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
   <div class="logo"><div class="logo-dot"></div>CareerForge Pro</div>
   <ul class="nav-links">
     <li><a href="#services">Services</a></li>
+    <li><a href="#pricing">Pricing</a></li>
     <li><a href="#how">How it works</a></li>
-    <li><a href="#reviews">Reviews</a></li>
   </ul>
-  <button class="btn-nav" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Get started →</button>
+  <button class="btn-nav" onclick="openEmailCapture()">Free ATS Score →</button>
 </nav>
+
 <div class="container">
   <section class="hero">
     <div class="hero-glow"></div>
-    <div class="eyebrow"><span>✦</span> AI-Powered Career Tools · Pay with Crypto</div>
-    <h1>Generate your resume.<br><span class="grad">Pay any way.</span></h1>
-    <p class="hero-sub">AI-powered resume generation, ATS optimization, interview prep, and salary negotiation. Pay with Bitcoin, Ethereum, USDC, or Solana.</p>
+    <div class="eyebrow"><span>✦</span> AI-Powered · ATS-Optimized · Pay with Crypto</div>
+    <h1>Get More Interviews<br>With an <span class="grad">ATS-Optimized</span><br>Resume</h1>
+    <p class="hero-sub">Upload your resume, get AI-powered improvements, ATS scoring, and job-specific recommendations in seconds.</p>
+    <div class="free-badge">✓ Free ATS score — no credit card required</div>
     <div class="hero-btns">
-      <button class="btn-primary" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">View services <span>→</span></button>
-      <button class="btn-ghost" onclick="document.getElementById('how').scrollIntoView({behavior:'smooth'})">How it works</button>
+      <button class="btn-primary" onclick="openEmailCapture()">Analyze My Resume Free →</button>
+      <button class="btn-ghost" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">View all tools</button>
     </div>
     <div class="coins-strip">
       <div class="coin-chip"><div class="cdot" style="background:#f7931a"></div>Bitcoin</div>
@@ -640,17 +751,32 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
   </section>
 
   <div class="stats">
-    <div class="stat"><div class="stat-n">12,400+</div><div class="stat-l">Resumes generated</div></div>
-    <div class="stat"><div class="stat-n">94%</div><div class="stat-l">Interview rate improvement</div></div>
-    <div class="stat"><div class="stat-n">$18K</div><div class="stat-l">Avg. salary increase</div></div>
-    <div class="stat"><div class="stat-n">150+</div><div class="stat-l">Countries served</div></div>
+    <div class="stat"><div class="stat-n" style="color:var(--accent2)">12,400+</div><div class="stat-l">Resumes generated</div></div>
+    <div class="stat"><div class="stat-n" style="color:var(--green)">94%</div><div class="stat-l">Interview rate improvement</div></div>
+    <div class="stat"><div class="stat-n" style="color:var(--gold)">$18K</div><div class="stat-l">Avg. salary increase</div></div>
+    <div class="stat"><div class="stat-n" style="color:var(--accent2)">150+</div><div class="stat-l">Countries served</div></div>
   </div>
+</div>
 
+<!-- EMAIL CAPTURE BAND -->
+<div class="capture-band">
+  <div class="capture-inner">
+    <h2>Get Your Free ATS Resume Score</h2>
+    <p>Paste your resume or enter your email — we'll send you a keyword gap report, ATS score, and one quick-win improvement instantly.</p>
+    <div class="capture-form">
+      <input type="email" id="capture-email" placeholder="your@email.com" autocomplete="email">
+      <button class="btn-capture" onclick="submitEmailCapture()">Send My Free Score →</button>
+    </div>
+    <div class="capture-note" id="capture-msg">No spam. Unsubscribe any time.</div>
+  </div>
+</div>
+
+<div class="container">
   <section class="section" id="services">
     <div class="sec-head">
       <div class="sec-ey">Career tools</div>
-      <h2 class="sec-title">AI-powered tools to land your next role</h2>
-      <p class="sec-sub">Generate professional resumes, practice interviews, and negotiate better salaries.</p>
+      <h2 class="sec-title">AI tools that land interviews</h2>
+      <p class="sec-sub">Generate professional resumes, practice interviews, and negotiate better salaries — pay with any major crypto.</p>
     </div>
     <div class="cards">
       <div class="card" onclick="openModal('resume_ai')">
@@ -658,9 +784,9 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
         <div class="card-name">AI Resume Generator</div>
         <p class="card-desc">Generate a professional, ATS-optimized resume from your skills and job description.</p>
         <ul class="feats">
-          <li><span class="fcheck">✓</span>AI-powered resume generation</li>
+          <li><span class="fcheck">✓</span>AI-written resume, tailored to your role</li>
           <li><span class="fcheck">✓</span>Professional cover letter included</li>
-          <li><span class="fcheck">✓</span>Download as PDF</li>
+          <li><span class="fcheck">✓</span>Download as formatted PDF</li>
         </ul>
         <div class="price-row"><div><div class="price">$49</div></div></div>
         <button class="btn-card">Generate my resume →</button>
@@ -670,7 +796,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
         <div class="card-name">Resume Optimizer</div>
         <p class="card-desc">ATS keyword analysis, letter-grade scoring, and a rewritten professional summary.</p>
         <ul class="feats">
-          <li><span class="fcheck">✓</span>ATS score with letter grade</li>
+          <li><span class="fcheck">✓</span>ATS score with letter grade (A–D)</li>
           <li><span class="fcheck">✓</span>Industry keyword gap analysis</li>
           <li><span class="fcheck">✓</span>Rewritten professional summary</li>
         </ul>
@@ -693,9 +819,9 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
       <div class="card" onclick="openModal('salary')">
         <div class="card-icon">💰</div>
         <div class="card-name">Salary Negotiator</div>
-        <p class="card-desc">Market rate benchmarking by role, seniority, and city — plus negotiation scripts.</p>
+        <p class="card-desc">Market rate benchmarking by role, seniority, and city — plus word-for-word negotiation scripts.</p>
         <ul class="feats">
-          <li><span class="fcheck">✓</span>Market rate vs. current salary</li>
+          <li><span class="fcheck">✓</span>Market rate vs. your current salary</li>
           <li><span class="fcheck">✓</span>Floor / target / stretch range</li>
           <li><span class="fcheck">✓</span>4 ready-to-use scripts</li>
         </ul>
@@ -704,38 +830,94 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
       </div>
     </div>
   </section>
+</div>
 
+<!-- PRICING -->
+<div class="pricing-section" id="pricing">
+  <div class="container">
+    <div class="sec-head">
+      <div class="sec-ey">Pricing</div>
+      <h2 class="sec-title">Simple, crypto-friendly pricing</h2>
+      <p class="sec-sub">Pay once per tool, or go Pro for unlimited access. No subscriptions with USD cards.</p>
+    </div>
+    <div class="pricing-grid">
+      <div class="plan">
+        <div class="plan-name">Free</div>
+        <div class="plan-price"><sup>$</sup>0</div>
+        <div class="plan-cadence">no payment needed</div>
+        <ul class="plan-feats">
+          <li><span class="fcheck">✓</span>1 ATS resume score</li>
+          <li><span class="fcheck">✓</span>Keyword gap snapshot</li>
+          <li><span class="fcheck">✓</span>Email delivery</li>
+          <li style="color:var(--dim)">✕ PDF download</li>
+          <li style="color:var(--dim)">✕ AI rewrite</li>
+        </ul>
+        <button class="btn-plan" onclick="openEmailCapture()">Get free score →</button>
+      </div>
+      <div class="plan popular">
+        <div class="plan-badge">Best value</div>
+        <div class="plan-name">Pro</div>
+        <div class="plan-price"><sup>$</sup>5</div>
+        <div class="plan-cadence">USDT / month · cancel any time</div>
+        <ul class="plan-feats">
+          <li><span class="fcheck">✓</span>Unlimited ATS scoring</li>
+          <li><span class="fcheck">✓</span>Unlimited resume rewrites</li>
+          <li><span class="fcheck">✓</span>Cover letters + PDFs</li>
+          <li><span class="fcheck">✓</span>Interview prep (all roles)</li>
+          <li><span class="fcheck">✓</span>Salary negotiation scripts</li>
+        </ul>
+        <button class="btn-plan accent" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Start with a tool →</button>
+      </div>
+      <div class="plan">
+        <div class="plan-name">Lifetime</div>
+        <div class="plan-price"><sup>$</sup>29</div>
+        <div class="plan-cadence">USDT · one-time payment</div>
+        <ul class="plan-feats">
+          <li><span class="fcheck">✓</span>Everything in Pro</li>
+          <li><span class="fcheck">✓</span>Lifetime access</li>
+          <li><span class="fcheck">✓</span>All future tools</li>
+          <li><span class="fcheck">✓</span>Priority support</li>
+          <li><span class="fcheck">✓</span>BTC, ETH, USDC, SOL accepted</li>
+        </ul>
+        <button class="btn-plan" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Get lifetime access →</button>
+      </div>
+    </div>
+    <div class="crypto-note">Pay with Bitcoin, Ethereum, USDC, or Solana. No credit card, no personal data stored.</div>
+  </div>
+</div>
+
+<div class="container">
   <div class="how-section" id="how">
     <div class="sec-head" style="margin-bottom:40px">
       <div class="sec-ey">Process</div>
       <h2 class="sec-title">Three steps, done in minutes</h2>
     </div>
     <div class="how-grid">
-      <div><div class="how-n">01</div><div class="how-l">Fill out your details</div></div>
+      <div><div class="how-n">01</div><div class="how-l">Fill out your details or paste your resume</div></div>
       <div><div class="how-n">02</div><div class="how-l">Pay with BTC, ETH, USDC, or SOL</div></div>
-      <div><div class="how-n">03</div><div class="how-l">Get your results + PDF</div></div>
+      <div><div class="how-n">03</div><div class="how-l">Get your results + downloadable PDF</div></div>
     </div>
   </div>
 
   <section class="section" id="reviews">
     <div class="sec-head">
       <div class="sec-ey">Reviews</div>
-      <h2 class="sec-title">Trusted by professionals worldwide</h2>
+      <h2 class="sec-title">Trusted by job seekers worldwide</h2>
     </div>
     <div class="cards">
       <div class="card" style="cursor:default">
         <div style="color:var(--gold);margin-bottom:12px">★★★★★</div>
-        <p class="card-desc" style="margin-bottom:12px">"Generated my resume in seconds. Got 3 interview calls the next week!"</p>
+        <p class="card-desc" style="margin-bottom:12px">"Generated my resume in seconds. Got 3 interview calls the next week — the ATS score made it obvious what I was missing."</p>
         <div style="font-size:13px;color:var(--muted)">— Priya S., Senior SWE</div>
       </div>
       <div class="card" style="cursor:default">
         <div style="color:var(--gold);margin-bottom:12px">★★★★★</div>
-        <p class="card-desc" style="margin-bottom:12px">"The salary scripts got me from $95K to $118K. Used the exact wording!"</p>
+        <p class="card-desc" style="margin-bottom:12px">"The salary scripts got me from $95K to $118K. Used the exact wording from the negotiation tool."</p>
         <div style="font-size:13px;color:var(--muted)">— Marcus T., Product Manager</div>
       </div>
       <div class="card" style="cursor:default">
         <div style="color:var(--gold);margin-bottom:12px">★★★★★</div>
-        <p class="card-desc" style="margin-bottom:12px">"Loved paying with crypto — instant delivery. Interview questions were spot on."</p>
+        <p class="card-desc" style="margin-bottom:12px">"Loved paying with crypto — instant delivery, no card details required. Interview questions were spot on for my Stripe round."</p>
         <div style="font-size:13px;color:var(--muted)">— Oluseun A., Data Analyst</div>
       </div>
     </div>
@@ -743,7 +925,14 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
 
   <footer>
     <div style="font-family:var(--display);font-weight:700">CareerForge Pro</div>
-    <div style="font-size:12px;color:var(--dim)">© 2025 CareerForge Pro · AI-Powered Career Tools · Pay with Crypto</div>
+    <div class="footer-links">
+      <a href="/ats-resume-checker">ATS Checker</a>
+      <a href="/ai-cover-letter-generator">Cover Letter Generator</a>
+      <a href="/interview-questions-generator">Interview Questions</a>
+      <a href="/resume-score">Resume Score</a>
+      <a href="/resume-keywords">Resume Keywords</a>
+    </div>
+    <div style="font-size:12px;color:var(--dim)">© 2025 CareerForge Pro</div>
   </footer>
 </div>
 
@@ -801,6 +990,86 @@ function stepsHtml(active) {
 }
 
 // ─────────────────────────────────────────────
+// EMAIL CAPTURE
+// ─────────────────────────────────────────────
+function openEmailCapture() {
+  document.getElementById('mtitle').textContent = 'Free ATS Resume Score';
+  activeService = null;
+  setBody(
+    '<div class="free-score-box">' +
+      '<div style="font-size:36px;margin-bottom:12px">📊</div>' +
+      '<h3>Get your ATS score in 30 seconds</h3>' +
+      '<p>Enter your email and paste your resume. We\'ll score it instantly and send you a keyword gap report — totally free.</p>' +
+      '<div class="fgroup"><label>Email address</label><input type="email" id="fc_email" placeholder="you@example.com" autocomplete="email"></div>' +
+      '<div class="fgroup"><label>Paste your resume <span style="color:var(--dim);font-weight:400;text-transform:none">(or describe your background)</span></label><textarea id="fc_resume" placeholder="Copy and paste your resume here…" style="min-height:120px"></textarea></div>' +
+      '<button class="btn-full" id="fc-btn" onclick="submitFreeCapture()">Get My Free ATS Score →</button>' +
+    '</div>' +
+    '<div style="text-align:center;margin-top:16px"><div style="font-size:12px;color:var(--dim)">Want the full analysis? See our <a href="#pricing" onclick="closeModal();document.getElementById(\'pricing\').scrollIntoView({behavior:\'smooth\'})" style="color:var(--accent2);text-decoration:none">paid plans</a> below.</div></div>'
+  );
+  document.getElementById('overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+
+function submitFreeCapture() {
+  var email  = (document.getElementById('fc_email').value  || '').trim();
+  var resume = (document.getElementById('fc_resume').value || '').trim();
+  var btn    = document.getElementById('fc-btn');
+  if (!email || !email.includes('@')) { alert('Please enter a valid email address.'); return; }
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin"></div> Scoring…';
+
+  fetch('/api/email-capture', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({email: email, resume: resume})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    var score = data.ats_score || 0;
+    var grade = data.grade || 'C';
+    var gc = grade === 'A' ? '#34d399' : grade === 'B' ? '#e6b44a' : '#f87171';
+    var miss = (data.missing_keywords || []).slice(0,4).map(function(k){ return '<span class="kw miss">'+escHtml(k)+'</span>'; }).join('');
+    setBody(
+      '<div style="text-align:center;margin-bottom:24px">' +
+        '<div style="font-size:56px;font-weight:700;font-family:var(--display);color:'+gc+'">'+score+'</div>' +
+        '<div style="font-size:14px;color:var(--muted);margin-bottom:8px">ATS Score — Grade <strong style="color:'+gc+'">'+grade+'</strong></div>' +
+        '<div style="font-size:13px;color:var(--muted)">Full report sent to <strong style="color:var(--txt)">'+escHtml(email)+'</strong></div>' +
+      '</div>' +
+      (miss ? '<div class="rsec"><div class="rsec-title">Quick wins — add these keywords</div><div class="kw-list">'+miss+'</div></div>' : '') +
+      '<div class="divider"></div>' +
+      '<div style="text-align:center"><div style="font-size:14px;color:var(--muted);margin-bottom:16px">Want the full rewrite + PDF?</div>' +
+      '<button class="btn-full" onclick="closeModal();openModal(\'resume_optimizer\')">Upgrade to Full Analysis — $49 →</button></div>'
+    );
+  })
+  .catch(function(err) {
+    btn.disabled = false; btn.textContent = 'Try again';
+    alert('Something went wrong: ' + err.message);
+  });
+}
+
+function submitEmailCapture() {
+  var email = (document.getElementById('capture-email').value || '').trim();
+  var msg   = document.getElementById('capture-msg');
+  if (!email || !email.includes('@')) {
+    if (msg) { msg.textContent = 'Please enter a valid email.'; msg.style.color = 'var(--red)'; }
+    return;
+  }
+  fetch('/api/email-capture', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({email: email, resume: ''})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function() {
+    if (msg) { msg.textContent = '✓ Check your inbox — score on its way!'; msg.style.color = 'var(--green)'; }
+    document.getElementById('capture-email').value = '';
+  })
+  .catch(function() {
+    if (msg) { msg.textContent = 'Something went wrong. Try the modal above.'; msg.style.color = 'var(--red)'; }
+  });
+}
+
+// ─────────────────────────────────────────────
 // MODAL OPEN / CLOSE
 // ─────────────────────────────────────────────
 function openModal(svc) {
@@ -826,6 +1095,15 @@ function handleOverlayClick(e) {
 }
 
 document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
+
+// Auto-open from URL param e.g. ?open=resume_ai
+(function() {
+  var p = new URLSearchParams(window.location.search);
+  var svc = p.get('open');
+  if (svc && ['resume_ai','resume_optimizer','interview','salary'].indexOf(svc) !== -1) {
+    setTimeout(function(){ openModal(svc); }, 300);
+  }
+})();
 
 // ─────────────────────────────────────────────
 // STEP 1 — FORM
@@ -929,7 +1207,6 @@ function renderStep2(selectedCoin) {
 }
 
 function selectCoin(coin) {
-  // Update visual selection without full re-render to avoid losing #pay-detail
   document.querySelectorAll('.coin-opt').forEach(function(el) { el.classList.remove('sel'); });
   var el = document.getElementById('coin-' + coin);
   if (el) el.classList.add('sel');
@@ -991,9 +1268,7 @@ function doCopy() {
     setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
   }
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(addr).then(markCopied).catch(function() {
-      fallbackCopy(addr, markCopied);
-    });
+    navigator.clipboard.writeText(addr).then(markCopied).catch(function() { fallbackCopy(addr, markCopied); });
   } else {
     fallbackCopy(addr, markCopied);
   }
@@ -1045,7 +1320,7 @@ function checkPayment() {
 }
 
 // ─────────────────────────────────────────────
-// AI RESUME GENERATION (after payment confirmed)
+// AI RESUME GENERATION
 // ─────────────────────────────────────────────
 function generateAIResume() {
   var btn = document.getElementById('verify-btn');
@@ -1063,7 +1338,6 @@ function generateAIResume() {
     renderStep3({ai_result: data});
   })
   .catch(function(err) {
-    // Show error in the verify status area rather than crashing
     var statusEl = document.getElementById('verify-status');
     if (btn) { btn.disabled = false; btn.textContent = 'Retry generation →'; btn.onclick = generateAIResume; }
     if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>Generation failed: ' + escHtml(err.message) + '. Please try again.</span></div>';
@@ -1086,7 +1360,6 @@ function downloadPDF() {
   .then(function(r) { return r.json(); })
   .then(function(data) {
     if (data.error) throw new Error(data.error);
-    // Create a temporary link and click it to trigger download
     var a = document.createElement('a');
     a.href = '/api/download/' + encodeURIComponent(data.filename);
     a.download = data.filename;
@@ -1109,19 +1382,13 @@ function renderStep3(result) {
   var content = '';
 
   if (activeService === 'resume_ai') {
-    if (result && result.ai_result) {
-      content = renderAIResult(result.ai_result);
-    } else {
-      content = '<div class="err-box"><span>⚠</span><span>Could not load AI result. Please contact support.</span></div>';
-    }
+    content = result && result.ai_result ? renderAIResult(result.ai_result) : '<div class="err-box"><span>⚠</span><span>Could not load AI result. Please contact support.</span></div>';
   } else if (activeService === 'resume_optimizer') {
     content = renderResumeResult(result);
   } else if (activeService === 'interview') {
     content = renderInterviewResult(result);
   } else if (activeService === 'salary') {
     content = renderSalaryResult(result);
-  } else {
-    content = '<p style="color:var(--muted)">Results unavailable.</p>';
   }
 
   setBody(
@@ -1267,6 +1534,46 @@ def api_services():
 def api_prices():
     return jsonify(CRYPTO_PRICES_USD)
 
+# NEW: Email capture endpoint
+@app.post("/api/email-capture")
+def email_capture():
+    body   = request.get_json(silent=True) or {}
+    email  = (body.get("email") or "").strip().lower()
+    resume = (body.get("resume") or "").strip()
+
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email required"}), 400
+
+    # Run a quick free ATS score if resume provided
+    result = {}
+    if resume:
+        result = run_resume_optimizer(resume, "Professional", "tech")
+
+    # Store email (in production, replace with a real DB / email service)
+    _emails[email] = {
+        "email":      email,
+        "has_resume": bool(resume),
+        "ats_score":  result.get("ats_score", 0),
+        "captured_at": utcnow(),
+    }
+
+    # In production: send transactional email with score via SendGrid / Mailgun
+    # For now just return the score so the UI can display it
+    return jsonify({
+        "ok":              True,
+        "ats_score":       result.get("ats_score", 0),
+        "grade":           result.get("grade", ""),
+        "missing_keywords": result.get("missing_keywords", [])[:4],
+        "message":         "Score sent to " + email,
+    })
+
+@app.get("/api/emails")  # admin endpoint — protect in production
+def list_emails():
+    secret = request.args.get("secret", "")
+    if secret != os.environ.get("ADMIN_SECRET", ""):
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify({"count": len(_emails), "emails": list(_emails.keys())})
+
 @app.post("/api/orders")
 def create_order():
     body = request.get_json(silent=True) or {}
@@ -1315,7 +1622,6 @@ def verify_order(order_id):
     if not order:
         return jsonify({"error": "Order not found"}), 404
 
-    # Already paid — return cached result
     if order["status"] == "paid":
         return jsonify({
             "status":        "paid",
@@ -1334,7 +1640,6 @@ def verify_order(order_id):
             "message":       "Payment not yet detected. Allow 10–30 minutes for network confirmation.",
         })
 
-    # Mark as paid
     order["status"]        = "paid"
     order["tx_hash"]       = check["tx_hash"]
     order["confirmations"] = check["confirmations"]
@@ -1351,7 +1656,6 @@ def verify_order(order_id):
                 payload.get("industry", "tech"),
             )
         elif svc == "resume_ai":
-            # Actual generation happens via /api/generate after this confirms payment
             result = {"requires_ai_generation": True}
         elif svc == "interview":
             result = run_interview_prep(
@@ -1425,7 +1729,6 @@ def create_pdf():
 
 @app.get("/api/download/<filename>")
 def download_file(filename):
-    # Sanitise: only alphanumeric, underscores, hyphens, dots
     safe = re.sub(r"[^a-zA-Z0-9_\-.]", "", filename)
     if not safe.endswith(".pdf"):
         return jsonify({"error": "Invalid filename"}), 400
@@ -1436,9 +1739,65 @@ def download_file(filename):
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "orders": len(_orders), "ai_results": len(_ai_results)})
+    return jsonify({"status": "ok", "orders": len(_orders), "ai_results": len(_ai_results), "emails": len(_emails)})
 
-# ─── SPA catch-all (must be last, and must NOT catch /api/* routes) ──────────
+# ── SEO LANDING PAGES ────────────────────────────────────────────────────────
+@app.get("/ats-resume-checker")
+def page_ats_checker():
+    return seo_page(
+        "Free ATS Resume Checker",
+        "Check If Your Resume Passes",
+        "Paste your resume and get an ATS compatibility score, keyword gaps, and a rewritten summary — free in seconds.",
+        "Free ATS resume checker. Get an instant ATS score, keyword gap analysis, and actionable improvements. Works for all industries.",
+        "Check My Resume Free",
+        "resume_optimizer"
+    )
+
+@app.get("/ai-cover-letter-generator")
+def page_cover_letter():
+    return seo_page(
+        "AI Cover Letter Generator",
+        "Write a Cover Letter That",
+        "AI generates a tailored, ATS-friendly cover letter from your resume and job description — under 5 minutes.",
+        "AI cover letter generator. Paste your resume and job description, get a professional, ATS-optimized cover letter instantly.",
+        "Generate My Cover Letter",
+        "resume_ai"
+    )
+
+@app.get("/interview-questions-generator")
+def page_interview():
+    return seo_page(
+        "Interview Questions Generator",
+        "Practice the Questions",
+        "Get 15+ role-specific interview questions, a full STAR example answer, and company situational questions tailored to your target role.",
+        "AI interview questions generator. Get role-specific technical, behavioral, and situational questions with STAR method example answers.",
+        "Get My Questions",
+        "interview"
+    )
+
+@app.get("/resume-score")
+def page_resume_score():
+    return seo_page(
+        "Free Resume Score Checker",
+        "Score Your Resume Before",
+        "Find out exactly how recruiters and ATS systems see your resume. Get a letter grade, keyword analysis, and three quick improvements.",
+        "Free resume score checker. Letter-grade ATS scoring, keyword gap analysis, and a rewritten professional summary.",
+        "Score My Resume",
+        "resume_optimizer"
+    )
+
+@app.get("/resume-keywords")
+def page_keywords():
+    return seo_page(
+        "Resume Keywords Analyzer",
+        "Find the Keywords Your",
+        "See which high-value industry keywords your resume is missing — and which ones to add to pass ATS filters and land interviews.",
+        "Resume keyword analyzer. Find missing ATS keywords for your industry and get suggestions to improve your resume's match rate.",
+        "Analyze My Keywords",
+        "resume_optimizer"
+    )
+
+# ── SPA catch-all ────────────────────────────────────────────────────────────
 @app.get("/")
 def index():
     return FRONTEND_HTML
@@ -1449,19 +1808,24 @@ def catch_all(path):
         return jsonify({"error": "Not found"}), 404
     return FRONTEND_HTML
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print()
-    print("─" * 56)
+    print("─" * 60)
     print("  CareerForge Pro  ·  http://localhost:5000")
-    print("─" * 56)
+    print("─" * 60)
     for k, v in WALLETS.items():
-        print(f"  {k.upper():<6} {v}")
-    print("─" * 56)
+        print(f"  {k.upper():<10} {v}")
+    print("─" * 60)
     for svc, info in SERVICES.items():
         print(f"    • {info['name']} (${info['price_usd']})")
-    print("─" * 56)
-    print("  Set ANTHROPIC_API_KEY env var for AI resume generation")
-    print("─" * 56)
+    print("─" * 60)
+    print("  SEO pages: /ats-resume-checker  /ai-cover-letter-generator")
+    print("             /interview-questions-generator  /resume-score  /resume-keywords")
+    print("─" * 60)
+    print("  Admin emails: GET /api/emails?secret=<ADMIN_SECRET>")
+    print("─" * 60)
+    print("  Set ANTHROPIC_API_KEY for AI resume generation")
+    print("─" * 60)
     print()
     app.run(debug=False, host="0.0.0.0", port=5000)
