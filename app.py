@@ -5,6 +5,7 @@ import json
 import uuid
 import urllib.request
 import random
+import sqlite3
 from io import BytesIO
 from datetime import datetime, timezone
 from datetime import datetime as dt
@@ -20,6 +21,9 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, PageBreak
 from reportlab.lib.colors import HexColor
+
+import pdfplumber
+import docx as docx_lib
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
@@ -72,7 +76,70 @@ LOCATION_MULT = {
 
 _orders = {}
 _ai_results = {}
-_emails = {}   # NEW: email capture store
+
+# ============================================================================
+# PERSISTENT STORAGE (SQLite) — survives restarts/redeploys as long as the
+# disk is persistent. On Render free tier the filesystem resets on redeploy,
+# so for a permanent list, attach a Render Disk mounted at DB_DIR.
+# ============================================================================
+DB_DIR  = os.environ.get("DB_DIR", os.path.dirname(__file__))
+DB_PATH = os.path.join(DB_DIR, "careerforge.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            email        TEXT UNIQUE NOT NULL,
+            has_resume   INTEGER DEFAULT 0,
+            ats_score    INTEGER DEFAULT 0,
+            grade        TEXT DEFAULT '',
+            source       TEXT DEFAULT 'capture_band',
+            captured_at  TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def save_email_lead(email, has_resume, ats_score, grade, source="capture_band"):
+    now = utcnow()
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO emails (email, has_resume, ats_score, grade, source, captured_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                has_resume = excluded.has_resume,
+                ats_score  = excluded.ats_score,
+                grade      = excluded.grade,
+                updated_at = excluded.updated_at
+        """, (email, int(has_resume), ats_score, grade, source, now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+def count_emails():
+    conn = get_db()
+    try:
+        return conn.execute("SELECT COUNT(*) AS c FROM emails").fetchone()["c"]
+    finally:
+        conn.close()
+
+def list_all_emails():
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT email, has_resume, ats_score, grade, source, captured_at FROM emails ORDER BY captured_at DESC").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 ACCENT = HexColor("#4f46e5")
 DARK   = HexColor("#111827")
@@ -292,6 +359,58 @@ def build_pdf(name, resume_text, cover_letter_text):
     doc.build(story)
     return filename
 
+def extract_text_from_upload(file_storage):
+    """
+    Extract plain text from an uploaded resume file.
+    Supports .pdf, .docx, .txt. Returns (text, error_message_or_None).
+    """
+    filename = (file_storage.filename or "").lower()
+    data = file_storage.read()
+
+    if not data:
+        return "", "Uploaded file is empty."
+
+    if len(data) > 8 * 1024 * 1024:
+        return "", "File is too large (max 8MB)."
+
+    try:
+        if filename.endswith(".pdf"):
+            text_parts = []
+            with pdfplumber.open(BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text() or ""
+                    text_parts.append(page_text)
+            text = "\n".join(text_parts).strip()
+            if not text:
+                return "", "Couldn't extract text from this PDF — it may be a scanned image. Try pasting the text instead."
+            return text, None
+
+        elif filename.endswith(".docx"):
+            doc = docx_lib.Document(BytesIO(data))
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            paragraphs.append(cell.text)
+            text = "\n".join(paragraphs).strip()
+            if not text:
+                return "", "Couldn't extract text from this document."
+            return text, None
+
+        elif filename.endswith(".txt"):
+            text = data.decode("utf-8", errors="ignore").strip()
+            return text, None
+
+        elif filename.endswith(".doc"):
+            return "", "Legacy .doc files aren't supported — please save as .docx or .pdf and re-upload."
+
+        else:
+            return "", "Unsupported file type. Please upload a PDF, DOCX, or TXT file."
+
+    except Exception as exc:
+        return "", f"Couldn't read this file: {str(exc)}"
+
 def run_resume_optimizer(resume_text, job_title, industry):
     keywords = INDUSTRY_KEYWORDS.get(industry.lower(), INDUSTRY_KEYWORDS["tech"])
     found   = [kw for kw in keywords if kw.lower() in resume_text.lower()]
@@ -495,7 +614,7 @@ def seo_page(title, headline, subheadline, description, cta_label, cta_service):
 </html>'''
 
 # ============================================================================
-# FRONTEND HTML  (upgraded)
+# FRONTEND HTML  (upgraded — with file upload for free ATS score)
 # ============================================================================
 FRONTEND_HTML = r'''<!DOCTYPE html>
 <html lang="en">
@@ -707,6 +826,21 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .free-score-box h3{font-family:var(--display);font-size:18px;margin-bottom:8px}
     .free-score-box p{font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.55}
 
+    /* ── FILE UPLOAD DROPZONE ── */
+    .dropzone{border:2px dashed var(--b2);border-radius:var(--r12);padding:28px 16px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg3)}
+    .dropzone:hover,.dropzone.drag{border-color:var(--accent);background:rgba(124,110,234,.06)}
+    .dropzone-icon{font-size:28px;margin-bottom:8px}
+    .dropzone-text{font-size:13px;color:var(--muted)}
+    .dropzone-text strong{color:var(--accent2)}
+    .dropzone-hint{font-size:11px;color:var(--dim);margin-top:6px}
+    .file-chip{display:flex;align-items:center;gap:10px;background:var(--bg3);border:1px solid var(--b2);border-radius:var(--r8);padding:10px 14px;margin-top:10px}
+    .file-chip-icon{font-size:18px;flex-shrink:0}
+    .file-chip-name{font-size:13px;color:var(--txt);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .file-chip-remove{background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px;padding:0 4px;flex-shrink:0}
+    .file-chip-remove:hover{color:var(--red)}
+    .or-divider{display:flex;align-items:center;gap:12px;margin:16px 0;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+    .or-divider::before,.or-divider::after{content:'';flex:1;height:1px;background:var(--b1)}
+
     footer{padding:48px 0;border-top:1px solid var(--b1);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
     .footer-links{display:flex;gap:24px;flex-wrap:wrap}
     .footer-links a{font-size:12px;color:var(--dim);text-decoration:none;transition:color .2s}
@@ -762,10 +896,10 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
 <div class="capture-band">
   <div class="capture-inner">
     <h2>Get Your Free ATS Resume Score</h2>
-    <p>Paste your resume or enter your email — we'll send you a keyword gap report, ATS score, and one quick-win improvement instantly.</p>
+    <p>Upload your resume or paste your email — we'll send you a keyword gap report, ATS score, and one quick-win improvement instantly.</p>
     <div class="capture-form">
       <input type="email" id="capture-email" placeholder="your@email.com" autocomplete="email">
-      <button class="btn-capture" onclick="submitEmailCapture()">Send My Free Score →</button>
+      <button class="btn-capture" onclick="openEmailCapture()">Get My Free Score →</button>
     </div>
     <div class="capture-note" id="capture-msg">No spam. Unsubscribe any time.</div>
   </div>
@@ -955,6 +1089,7 @@ var activeService = null;
 var formPayload = {};
 var currentOrder = null;
 var aiResult = null;
+var fcSelectedFile = null;
 
 var SERVICE_NAMES  = {resume_ai:'AI Resume Generator',resume_optimizer:'Resume Optimizer',interview:'Interview Prep',salary:'Salary Negotiator'};
 var SERVICE_PRICES = {resume_ai:49,resume_optimizer:49,interview:29,salary:19};
@@ -989,62 +1124,148 @@ function stepsHtml(active) {
   }).join('');
 }
 
+function fileIconFor(name) {
+  var n = (name || '').toLowerCase();
+  if (n.endsWith('.pdf')) return '📕';
+  if (n.endsWith('.docx') || n.endsWith('.doc')) return '📘';
+  return '📄';
+}
+
 // ─────────────────────────────────────────────
-// EMAIL CAPTURE
+// EMAIL CAPTURE  (with file upload)
 // ─────────────────────────────────────────────
 function openEmailCapture() {
   document.getElementById('mtitle').textContent = 'Free ATS Resume Score';
   activeService = null;
+  fcSelectedFile = null;
   setBody(
     '<div class="free-score-box">' +
       '<div style="font-size:36px;margin-bottom:12px">📊</div>' +
       '<h3>Get your ATS score in 30 seconds</h3>' +
-      '<p>Enter your email and paste your resume. We\'ll score it instantly and send you a keyword gap report — totally free.</p>' +
-      '<div class="fgroup"><label>Email address</label><input type="email" id="fc_email" placeholder="you@example.com" autocomplete="email"></div>' +
-      '<div class="fgroup"><label>Paste your resume <span style="color:var(--dim);font-weight:400;text-transform:none">(or describe your background)</span></label><textarea id="fc_resume" placeholder="Copy and paste your resume here…" style="min-height:120px"></textarea></div>' +
+      '<p>Enter your email and upload your resume. We\'ll score it instantly and send you a keyword gap report — totally free.</p>' +
+      '<div class="fgroup" style="text-align:left"><label>Email address</label><input type="email" id="fc_email" placeholder="you@example.com" autocomplete="email"></div>' +
+      '<div class="fgroup" style="text-align:left">' +
+        '<label>Upload your resume</label>' +
+        '<div class="dropzone" id="fc-dropzone" onclick="document.getElementById(\'fc_file\').click()">' +
+          '<div class="dropzone-icon">📤</div>' +
+          '<div class="dropzone-text"><strong>Click to upload</strong> or drag and drop</div>' +
+          '<div class="dropzone-hint">PDF or DOCX, up to 8MB</div>' +
+        '</div>' +
+        '<input type="file" id="fc_file" accept=".pdf,.docx,.txt" style="display:none" onchange="handleFcFileSelect(this.files[0])">' +
+        '<div id="fc-file-chip"></div>' +
+        '<div class="or-divider">or paste text instead</div>' +
+        '<textarea id="fc_resume" placeholder="Paste your resume text here…" style="min-height:90px"></textarea>' +
+      '</div>' +
       '<button class="btn-full" id="fc-btn" onclick="submitFreeCapture()">Get My Free ATS Score →</button>' +
     '</div>' +
     '<div style="text-align:center;margin-top:16px"><div style="font-size:12px;color:var(--dim)">Want the full analysis? See our <a href="#pricing" onclick="closeModal();document.getElementById(\'pricing\').scrollIntoView({behavior:\'smooth\'})" style="color:var(--accent2);text-decoration:none">paid plans</a> below.</div></div>'
   );
   document.getElementById('overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
+
+  var dz = document.getElementById('fc-dropzone');
+  ['dragenter','dragover'].forEach(function(evt) {
+    dz.addEventListener(evt, function(e) { e.preventDefault(); dz.classList.add('drag'); });
+  });
+  ['dragleave','drop'].forEach(function(evt) {
+    dz.addEventListener(evt, function(e) { e.preventDefault(); dz.classList.remove('drag'); });
+  });
+  dz.addEventListener('drop', function(e) {
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleFcFileSelect(f);
+  });
+}
+
+function handleFcFileSelect(file) {
+  if (!file) return;
+  var validExt = /\.(pdf|docx|txt)$/i;
+  if (!validExt.test(file.name)) {
+    alert('Please upload a PDF, DOCX, or TXT file.');
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    alert('File is too large. Max size is 8MB.');
+    return;
+  }
+  fcSelectedFile = file;
+  var chip = document.getElementById('fc-file-chip');
+  if (chip) {
+    chip.innerHTML = '<div class="file-chip">' +
+      '<div class="file-chip-icon">' + fileIconFor(file.name) + '</div>' +
+      '<div class="file-chip-name">' + escHtml(file.name) + '</div>' +
+      '<button class="file-chip-remove" onclick="clearFcFile()" type="button">✕</button>' +
+    '</div>';
+  }
+  var ta = document.getElementById('fc_resume');
+  if (ta) ta.placeholder = 'File selected — you can still paste text as a backup';
+}
+
+function clearFcFile() {
+  fcSelectedFile = null;
+  var input = document.getElementById('fc_file');
+  if (input) input.value = '';
+  var chip = document.getElementById('fc-file-chip');
+  if (chip) chip.innerHTML = '';
 }
 
 function submitFreeCapture() {
   var email  = (document.getElementById('fc_email').value  || '').trim();
-  var resume = (document.getElementById('fc_resume').value || '').trim();
+  var pasted = (document.getElementById('fc_resume').value || '').trim();
   var btn    = document.getElementById('fc-btn');
   if (!email || !email.includes('@')) { alert('Please enter a valid email address.'); return; }
+  if (!fcSelectedFile && !pasted) { alert('Please upload your resume or paste the text.'); return; }
+
   btn.disabled = true;
   btn.innerHTML = '<div class="spin"></div> Scoring…';
 
-  fetch('/api/email-capture', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({email: email, resume: resume})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    var score = data.ats_score || 0;
-    var grade = data.grade || 'C';
-    var gc = grade === 'A' ? '#34d399' : grade === 'B' ? '#e6b44a' : '#f87171';
-    var miss = (data.missing_keywords || []).slice(0,4).map(function(k){ return '<span class="kw miss">'+escHtml(k)+'</span>'; }).join('');
-    setBody(
-      '<div style="text-align:center;margin-bottom:24px">' +
-        '<div style="font-size:56px;font-weight:700;font-family:var(--display);color:'+gc+'">'+score+'</div>' +
-        '<div style="font-size:14px;color:var(--muted);margin-bottom:8px">ATS Score — Grade <strong style="color:'+gc+'">'+grade+'</strong></div>' +
-        '<div style="font-size:13px;color:var(--muted)">Full report sent to <strong style="color:var(--txt)">'+escHtml(email)+'</strong></div>' +
-      '</div>' +
-      (miss ? '<div class="rsec"><div class="rsec-title">Quick wins — add these keywords</div><div class="kw-list">'+miss+'</div></div>' : '') +
-      '<div class="divider"></div>' +
-      '<div style="text-align:center"><div style="font-size:14px;color:var(--muted);margin-bottom:16px">Want the full rewrite + PDF?</div>' +
-      '<button class="btn-full" onclick="closeModal();openModal(\'resume_optimizer\')">Upgrade to Full Analysis — $49 →</button></div>'
-    );
-  })
-  .catch(function(err) {
-    btn.disabled = false; btn.textContent = 'Try again';
-    alert('Something went wrong: ' + err.message);
-  });
+  if (fcSelectedFile) {
+    var fd = new FormData();
+    fd.append('email', email);
+    fd.append('resume_file', fcSelectedFile);
+    fetch('/api/upload-resume', {method: 'POST', body: fd})
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) throw new Error(data.error);
+        renderFreeScoreResult(email, data);
+      })
+      .catch(function(err) {
+        btn.disabled = false; btn.textContent = 'Try again';
+        alert('Something went wrong: ' + err.message);
+      });
+  } else {
+    fetch('/api/email-capture', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: email, resume: pasted})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.error) throw new Error(data.error);
+      renderFreeScoreResult(email, data);
+    })
+    .catch(function(err) {
+      btn.disabled = false; btn.textContent = 'Try again';
+      alert('Something went wrong: ' + err.message);
+    });
+  }
+}
+
+function renderFreeScoreResult(email, data) {
+  var score = data.ats_score || 0;
+  var grade = data.grade || 'C';
+  var gc = grade === 'A' ? '#34d399' : grade === 'B' ? '#e6b44a' : '#f87171';
+  var miss = (data.missing_keywords || []).slice(0,4).map(function(k){ return '<span class="kw miss">'+escHtml(k)+'</span>'; }).join('');
+  setBody(
+    '<div style="text-align:center;margin-bottom:24px">' +
+      '<div style="font-size:56px;font-weight:700;font-family:var(--display);color:'+gc+'">'+score+'</div>' +
+      '<div style="font-size:14px;color:var(--muted);margin-bottom:8px">ATS Score — Grade <strong style="color:'+gc+'">'+grade+'</strong></div>' +
+      '<div style="font-size:13px;color:var(--muted)">Full report sent to <strong style="color:var(--txt)">'+escHtml(email)+'</strong></div>' +
+    '</div>' +
+    (miss ? '<div class="rsec"><div class="rsec-title">Quick wins — add these keywords</div><div class="kw-list">'+miss+'</div></div>' : '') +
+    '<div class="divider"></div>' +
+    '<div style="text-align:center"><div style="font-size:14px;color:var(--muted);margin-bottom:16px">Want the full rewrite + PDF?</div>' +
+    '<button class="btn-full" onclick="closeModal();openModal(\'resume_optimizer\')">Upgrade to Full Analysis — $49 →</button></div>'
+  );
 }
 
 function submitEmailCapture() {
@@ -1534,45 +1755,82 @@ def api_services():
 def api_prices():
     return jsonify(CRYPTO_PRICES_USD)
 
-# NEW: Email capture endpoint
+# Email capture endpoint — paste-text path (no file). Persists to SQLite.
 @app.post("/api/email-capture")
 def email_capture():
     body   = request.get_json(silent=True) or {}
     email  = (body.get("email") or "").strip().lower()
     resume = (body.get("resume") or "").strip()
 
-    if not email or "@" not in email:
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"error": "Valid email required"}), 400
 
-    # Run a quick free ATS score if resume provided
     result = {}
     if resume:
         result = run_resume_optimizer(resume, "Professional", "tech")
 
-    # Store email (in production, replace with a real DB / email service)
-    _emails[email] = {
-        "email":      email,
-        "has_resume": bool(resume),
-        "ats_score":  result.get("ats_score", 0),
-        "captured_at": utcnow(),
-    }
+    save_email_lead(
+        email=email,
+        has_resume=bool(resume),
+        ats_score=result.get("ats_score", 0),
+        grade=result.get("grade", ""),
+        source="capture_band_paste",
+    )
 
-    # In production: send transactional email with score via SendGrid / Mailgun
-    # For now just return the score so the UI can display it
+    # In production: send a transactional email with the score via SendGrid / Mailgun / Postmark.
     return jsonify({
-        "ok":              True,
-        "ats_score":       result.get("ats_score", 0),
-        "grade":           result.get("grade", ""),
+        "ok":               True,
+        "ats_score":        result.get("ats_score", 0),
+        "grade":            result.get("grade", ""),
         "missing_keywords": result.get("missing_keywords", [])[:4],
-        "message":         "Score sent to " + email,
+        "message":          "Score sent to " + email,
     })
 
-@app.get("/api/emails")  # admin endpoint — protect in production
+# Email capture endpoint — file upload path (PDF/DOCX/TXT). Persists to SQLite.
+@app.post("/api/upload-resume")
+def upload_resume():
+    email = (request.form.get("email") or "").strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"error": "Valid email required"}), 400
+
+    if "resume_file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file_storage = request.files["resume_file"]
+    if not file_storage or not file_storage.filename:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    resume_text, err = extract_text_from_upload(file_storage)
+    if err:
+        return jsonify({"error": err}), 400
+
+    result = run_resume_optimizer(resume_text, "Professional", "tech")
+
+    save_email_lead(
+        email=email,
+        has_resume=True,
+        ats_score=result.get("ats_score", 0),
+        grade=result.get("grade", ""),
+        source="capture_band_upload",
+    )
+
+    return jsonify({
+        "ok":               True,
+        "ats_score":        result.get("ats_score", 0),
+        "grade":            result.get("grade", ""),
+        "missing_keywords": result.get("missing_keywords", [])[:4],
+        "word_count":       result.get("word_count", 0),
+        "message":          "Score sent to " + email,
+    })
+
+# Admin endpoint — protect with ADMIN_SECRET env var in production
+@app.get("/api/emails")
 def list_emails():
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
     secret = request.args.get("secret", "")
-    if secret != os.environ.get("ADMIN_SECRET", ""):
+    if not admin_secret or secret != admin_secret:
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"count": len(_emails), "emails": list(_emails.keys())})
+    return jsonify({"count": count_emails(), "emails": list_all_emails()})
 
 @app.post("/api/orders")
 def create_order():
@@ -1739,7 +1997,7 @@ def download_file(filename):
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "orders": len(_orders), "ai_results": len(_ai_results), "emails": len(_emails)})
+    return jsonify({"status": "ok", "orders": len(_orders), "ai_results": len(_ai_results), "emails": count_emails()})
 
 # ── SEO LANDING PAGES ────────────────────────────────────────────────────────
 @app.get("/ats-resume-checker")
@@ -1823,6 +2081,7 @@ if __name__ == "__main__":
     print("  SEO pages: /ats-resume-checker  /ai-cover-letter-generator")
     print("             /interview-questions-generator  /resume-score  /resume-keywords")
     print("─" * 60)
+    print("  Free ATS score + email capture: paste text OR upload PDF/DOCX/TXT")
     print("  Admin emails: GET /api/emails?secret=<ADMIN_SECRET>")
     print("─" * 60)
     print("  Set ANTHROPIC_API_KEY for AI resume generation")
