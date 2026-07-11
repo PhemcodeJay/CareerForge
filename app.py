@@ -4,7 +4,9 @@ import re
 import json
 import uuid
 import urllib.request
-import random
+import urllib.error
+import hashlib
+import hmac
 import sqlite3
 from io import BytesIO
 from datetime import datetime, timezone
@@ -34,13 +36,6 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-WALLETS = {
-    "bitcoin":  os.environ.get("WALLET_BTC",  "bc1qyourbitcoinaddresshere"),
-    "ethereum": os.environ.get("WALLET_ETH",  "0xYourEthereumAddressHere"),
-    "usdc":     os.environ.get("WALLET_USDC", "0xYourUSDCAddressHere"),
-    "solana":   os.environ.get("WALLET_SOL",  "YourSolanaAddressHere"),
-}
-
 SERVICES = {
     "resume_ai":        {"name": "AI Resume Generator",  "price_usd": 49},
     "resume_optimizer": {"name": "Resume Optimizer",     "price_usd": 49},
@@ -54,6 +49,113 @@ CRYPTO_PRICES_USD = {
     "usdc":     1.0,
     "solana":   150,
 }
+# NOTE: CRYPTO_PRICES_USD is only used to show a rough "approx amount" estimate
+# on the coin-selection screen BEFORE an order is created. The real amount a
+# customer must pay is whatever NOWPayments returns when the order is
+# created below -- that is the number actually enforced.
+
+# ============================================================================
+# REAL CRYPTO PAYMENTS via NOWPayments
+# ----------------------------------------------------------------------------
+# Why a payment processor instead of a single static address per coin:
+# every order needs its OWN deposit address, or there is no reliable way to
+# tell which customer paid which invoice. NOWPayments (or an equivalent
+# processor such as Coinbase Commerce / BTCPay Server) generates a unique
+# address per payment and tells us, via webhook plus a status API, when it
+# has actually been paid.
+#
+# Required environment variables:
+#   NOWPAYMENTS_API_KEY    - from your NOWPayments dashboard
+#   NOWPAYMENTS_IPN_SECRET - IPN secret key, used to verify webhook signatures
+#   PUBLIC_BASE_URL        - e.g. https://careerforge-pm1q.onrender.com
+#                            (NOWPayments must be able to reach this URL)
+#   NOWPAYMENTS_SANDBOX    - set to "true" to use the sandbox API while testing
+# ============================================================================
+NOWPAYMENTS_API_KEY    = os.environ.get("NOWPAYMENTS_API_KEY", "")
+NOWPAYMENTS_IPN_SECRET  = os.environ.get("NOWPAYMENTS_IPN_SECRET", "")
+PUBLIC_BASE_URL         = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+NOWPAYMENTS_BASE_URL    = (
+    "https://api-sandbox.nowpayments.io/v1"
+    if os.environ.get("NOWPAYMENTS_SANDBOX", "").strip().lower() in ("1", "true", "yes")
+    else "https://api.nowpayments.io/v1"
+)
+
+# Map our internal coin names to NOWPayments currency codes. USDC in
+# particular has several network variants (usdcerc20, usdcsol, usdcmatic,
+# usdctrc20, ...) -- confirm the exact code you want against
+# GET {NOWPAYMENTS_BASE_URL}/currencies before going live, since NOWPayments
+# updates these periodically.
+COIN_TO_NOWPAYMENTS_CURRENCY = {
+    "bitcoin":  "btc",
+    "ethereum": "eth",
+    "usdc":     "usdcerc20",
+    "solana":   "sol",
+}
+
+# Terminal NOWPayments statuses we treat as "customer has genuinely paid".
+PAID_STATUSES = {"confirmed", "finished"}
+# Statuses that mean the payment is dead and won't become paid.
+DEAD_STATUSES = {"failed", "refunded", "expired"}
+
+def payments_configured():
+    return bool(NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL)
+
+def _nowpayments_request(method, path, body=None):
+    if not NOWPAYMENTS_API_KEY:
+        raise RuntimeError(
+            "Crypto payments are not configured on this server "
+            "(missing NOWPAYMENTS_API_KEY). No payment can be created or verified."
+        )
+    url = f"{NOWPAYMENTS_BASE_URL}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Payment processor error ({e.code}): {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not reach payment processor: {e.reason}")
+
+def create_nowpayments_payment(internal_order_id, usd_amount, coin):
+    pay_currency = COIN_TO_NOWPAYMENTS_CURRENCY.get(coin)
+    if not pay_currency:
+        raise RuntimeError(f"Unsupported coin: {coin}")
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL is not configured. NOWPayments needs a public "
+            "HTTPS URL to send its payment-confirmation webhook to."
+        )
+    body = {
+        "price_amount":      usd_amount,
+        "price_currency":    "usd",
+        "pay_currency":      pay_currency,
+        "order_id":          internal_order_id,
+        "order_description": "CareerForge Pro purchase",
+        "ipn_callback_url":  f"{PUBLIC_BASE_URL}/api/webhook/nowpayments",
+    }
+    return _nowpayments_request("POST", "/payment", body)
+
+def get_nowpayments_status(payment_id):
+    return _nowpayments_request("GET", f"/payment/{payment_id}")
+
+def verify_nowpayments_signature(payload_dict, signature_header):
+    """
+    NOWPayments signs IPN callbacks with HMAC-SHA512 over the JSON body
+    with its keys sorted alphabetically. Reject anything that doesn't match
+    -- this is what actually stops someone from forging a fake "paid" webhook.
+    """
+    if not NOWPAYMENTS_IPN_SECRET or not signature_header:
+        return False
+    ordered = json.dumps(payload_dict, sort_keys=True, separators=(",", ":"))
+    computed = hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), ordered.encode(), hashlib.sha512).hexdigest()
+    return hmac.compare_digest(computed, signature_header)
 
 INDUSTRY_KEYWORDS = {
     "tech":       ["Python", "JavaScript", "AWS", "Agile", "REST API", "Git", "React", "Docker", "Kubernetes", "CI/CD"],
@@ -74,7 +176,6 @@ LOCATION_MULT = {
     "remote": 1.02,
 }
 
-_orders = {}
 _ai_results = {}
 
 # ============================================================================
@@ -104,10 +205,89 @@ def init_db():
             updated_at   TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id              TEXT PRIMARY KEY,
+            service         TEXT NOT NULL,
+            coin            TEXT NOT NULL,
+            usd_amount      REAL NOT NULL,
+            payment_id      TEXT,
+            pay_address     TEXT,
+            pay_amount      REAL,
+            pay_currency    TEXT,
+            status          TEXT DEFAULT 'waiting',
+            payload_json    TEXT,
+            result_json     TEXT,
+            tx_hash         TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            paid_at         TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
+
+def db_create_order(order_id, service, coin, usd_amount, payment_id, pay_address, pay_amount, pay_currency, payload):
+    now = utcnow()
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO orders (id, service, coin, usd_amount, payment_id, pay_address, pay_amount,
+                                 pay_currency, status, payload_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)
+        """, (order_id, service, coin, usd_amount, payment_id, pay_address, pay_amount,
+              pay_currency, json.dumps(payload or {}), now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+def db_get_order(order_id):
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def db_get_order_by_payment_id(payment_id):
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM orders WHERE payment_id = ?", (payment_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def db_update_order_status(order_id, status, tx_hash=None):
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE orders SET status = ?, tx_hash = COALESCE(?, tx_hash), updated_at = ? WHERE id = ?",
+            (status, tx_hash, utcnow(), order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def db_mark_order_paid(order_id, result, tx_hash=None):
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE orders SET status = 'paid', result_json = ?, tx_hash = COALESCE(?, tx_hash), "
+            "updated_at = ?, paid_at = ? WHERE id = ?",
+            (json.dumps(result), tx_hash, utcnow(), utcnow(), order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def count_orders():
+    conn = get_db()
+    try:
+        return conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+    finally:
+        conn.close()
 
 def save_email_lead(email, has_resume, ats_score, grade, source="capture_band"):
     now = utcnow()
@@ -184,40 +364,14 @@ def generate_qr(address, coin, amount):
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
-def verify_on_chain(coin, address, expected_amount, tx_hash=None):
-    confirmed = random.random() > 0.10
-    return {
-        "confirmed": confirmed,
-        "confirmations": random.randint(1, 6) if confirmed else 0,
-        "tx_hash": tx_hash or secrets.token_hex(32),
-    }
-
 def call_claude(prompt):
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        return """PROFESSIONAL SUMMARY
-Results-driven professional with 8+ years of experience delivering high-impact solutions across technology and business domains. Proven track record of leading cross-functional teams, optimizing processes, and driving measurable revenue growth.
-
-CORE SKILLS
-Python, JavaScript, AWS, Agile, REST API, Git, React, Docker, Kubernetes, CI/CD
-
-PROFESSIONAL EXPERIENCE
-Senior Software Engineer | TechCorp Inc. | 2021–Present
-• Led a team of 5 engineers to deliver a customer-facing platform that increased revenue by 40% year-over-year
-• Reduced system latency by 35% through architectural improvements and database query optimization
-• Implemented CI/CD pipeline that cut deployment time by 60% and eliminated manual deployment errors
-
-Software Engineer | GrowthStartup | 2018–2021
-• Designed and shipped REST APIs serving 2M+ daily active users with 99.9% uptime
-• Reduced cloud infrastructure costs by $120K/year by migrating legacy services to containerized microservices
-• Mentored 3 junior engineers; 2 were promoted within 18 months
-
-Junior Developer | AgencyXYZ | 2016–2018
-• Built 12 client-facing web applications on time and under budget, achieving a 98% client satisfaction rate
-• Automated reporting workflows saving 10+ hours per week across the operations team
-
-EDUCATION
-B.S. in Computer Science, University of Technology, 2016"""
+        raise RuntimeError(
+            "AI resume generation is not configured on this server "
+            "(missing ANTHROPIC_API_KEY). Set this environment variable before "
+            "accepting payment for the AI Resume Generator / Cover Letter tool."
+        )
 
     payload = json.dumps({
         "model": "claude-3-5-sonnet-20241022",
@@ -1090,6 +1244,7 @@ var formPayload = {};
 var currentOrder = null;
 var aiResult = null;
 var fcSelectedFile = null;
+var pollTimer = null;
 
 var SERVICE_NAMES  = {resume_ai:'AI Resume Generator',resume_optimizer:'Resume Optimizer',interview:'Interview Prep',salary:'Salary Negotiator'};
 var SERVICE_PRICES = {resume_ai:49,resume_optimizer:49,interview:29,salary:19};
@@ -1129,6 +1284,10 @@ function fileIconFor(name) {
   if (n.endsWith('.pdf')) return '📕';
   if (n.endsWith('.docx') || n.endsWith('.doc')) return '📘';
   return '📄';
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
 }
 
 // ─────────────────────────────────────────────
@@ -1298,6 +1457,7 @@ function openModal(svc) {
   formPayload = {};
   currentOrder = null;
   aiResult = null;
+  stopPolling();
   document.getElementById('mtitle').textContent = SERVICE_NAMES[svc];
   renderStep1();
   document.getElementById('overlay').classList.add('open');
@@ -1309,6 +1469,7 @@ function closeModal() {
   document.body.style.overflow = '';
   activeService = null;
   currentOrder = null;
+  stopPolling();
 }
 
 function handleOverlayClick(e) {
@@ -1410,7 +1571,7 @@ function renderStep2(selectedCoin) {
     var sel = selectedCoin === c ? ' sel' : '';
     return '<div class="coin-opt' + sel + '" id="coin-' + c + '" onclick="selectCoin(\'' + c + '\')">' +
            '<div class="clogo" style="background:' + m.color + '22;color:' + m.color + '">' + m.logo + '</div>' +
-           '<div><div class="cname">' + m.label + '</div><div class="camt">≈ ' + amt + ' ' + m.ticker + '</div></div>' +
+           '<div><div class="cname">' + m.label + '</div><div class="camt">≈ ' + amt + ' ' + m.ticker + ' (estimate)</div></div>' +
            '</div>';
   }).join('');
 
@@ -1437,18 +1598,19 @@ function selectCoin(coin) {
 function createOrder(coin) {
   var el = document.getElementById('pay-detail');
   if (!el) return;
-  el.innerHTML = '<div style="text-align:center;padding:24px"><div class="spin spin-accent"></div><div style="margin-top:12px;font-size:13px;color:var(--muted)">Generating payment address…</div></div>';
+  el.innerHTML = '<div style="text-align:center;padding:24px"><div class="spin spin-accent"></div><div style="margin-top:12px;font-size:13px;color:var(--muted)">Creating a unique payment address…</div></div>';
 
   fetch('/api/orders', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({service: activeService, coin: coin, payload: formPayload})
   })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) throw new Error(data.error);
-    currentOrder = data;
-    renderPayDetail(data);
+  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
+  .then(function(res) {
+    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Could not create payment');
+    currentOrder = res.data;
+    renderPayDetail(res.data);
+    startPolling();
   })
   .catch(function(err) {
     if (el) el.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(err.message) + '</span></div>';
@@ -1458,7 +1620,7 @@ function createOrder(coin) {
 function renderPayDetail(order) {
   var el = document.getElementById('pay-detail');
   if (!el) return;
-  var m = COINS[order.coin];
+  var m = COINS[order.coin] || {color:'#7c6eea', ticker:(order.pay_currency || '').toUpperCase()};
   var qrHtml = order.qr
     ? '<img src="' + escHtml(order.qr) + '" alt="Payment QR code">'
     : '<div style="font-size:11px;color:#999;padding:10px">QR unavailable</div>';
@@ -1466,15 +1628,16 @@ function renderPayDetail(order) {
   el.innerHTML =
     '<div class="pay-box">' +
       '<div class="qr-wrap">' + qrHtml + '</div>' +
-      '<div class="pay-amt" style="color:' + m.color + '">' + escHtml(String(order.amount)) + ' ' + m.ticker + '</div>' +
+      '<div class="pay-amt" style="color:' + m.color + '">' + escHtml(String(order.amount)) + ' ' + escHtml(m.ticker || '') + '</div>' +
       '<div class="pay-usd">≈ $' + escHtml(String(order.usd)) + ' USD</div>' +
       '<div class="addr-box">' +
         '<div class="addr-text" id="addr-text">' + escHtml(order.address) + '</div>' +
         '<button class="copy-btn" id="copy-btn" onclick="doCopy()">Copy</button>' +
       '</div>' +
     '</div>' +
-    '<div class="warn-box"><span>⚠</span><span>Send <strong>exactly ' + escHtml(String(order.amount)) + ' ' + m.ticker + '</strong> to this address. Include network fees. Do not send a different amount.</span></div>' +
-    '<button class="btn-full" id="verify-btn" onclick="checkPayment()">I\'ve sent the payment →</button>' +
+    '<div class="warn-box"><span>⚠</span><span>Send <strong>exactly ' + escHtml(String(order.amount)) + ' ' + escHtml(m.ticker || '') + '</strong> to this address. This address is unique to your order — do not reuse it for future payments. Include network fees.</span></div>' +
+    '<div class="info-box" id="wait-status"><span>⏳</span><span>Waiting for payment… this page checks automatically every 10 seconds. You can also click below.</span></div>' +
+    '<button class="btn-full" id="verify-btn" onclick="checkPayment()">Check payment status now →</button>' +
     '<div id="verify-status" style="margin-top:12px"></div>';
 }
 
@@ -1507,37 +1670,72 @@ function fallbackCopy(text, cb) {
 }
 
 // ─────────────────────────────────────────────
-// PAYMENT VERIFICATION
+// PAYMENT VERIFICATION (real: polls our backend, which in turn checks
+// the payment processor's status / has already been updated by its webhook)
 // ─────────────────────────────────────────────
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(function() {
+    if (!currentOrder) { stopPolling(); return; }
+    pollOnce(true);
+  }, 10000);
+}
+
+function pollOnce(silent) {
+  if (!currentOrder) return;
+  fetch('/api/orders/' + currentOrder.order_id + '/verify', {method: 'POST'})
+    .then(function(r) { return r.json(); })
+    .then(function(data) { handleVerifyResponse(data, silent); })
+    .catch(function() { /* silent polling failures are fine, next tick retries */ });
+}
+
 function checkPayment() {
   if (!currentOrder) return;
   var btn      = document.getElementById('verify-btn');
   var statusEl = document.getElementById('verify-status');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Verifying payment…'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Checking…'; }
   if (statusEl) statusEl.innerHTML = '';
 
-  fetch('/api/orders/' + currentOrder.order_id + '/verify', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: '{}'
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.status === 'paid' && data.result) {
-      if (activeService === 'resume_ai') {
-        generateAIResume();
-      } else {
-        renderStep3(data.result);
-      }
-    } else {
-      if (btn) { btn.disabled = false; btn.textContent = 'Check again →'; }
-      if (statusEl) statusEl.innerHTML = '<div class="warn-box"><span>⏳</span><span>Payment not yet detected. Allow 10–30 minutes for network confirmation, then try again.</span></div>';
+  fetch('/api/orders/' + currentOrder.order_id + '/verify', {method: 'POST'})
+    .then(function(r) { return r.json(); })
+    .then(function(data) { handleVerifyResponse(data, false); })
+    .catch(function(err) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
+      if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(err.message) + '</span></div>';
+    });
+}
+
+function handleVerifyResponse(data, silent) {
+  var btn      = document.getElementById('verify-btn');
+  var statusEl = document.getElementById('verify-status');
+  var waitEl   = document.getElementById('wait-status');
+
+  if (data.error) {
+    if (!silent) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
+      if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(data.error) + '</span></div>';
     }
-  })
-  .catch(function(err) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Check again →'; }
-    if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(err.message) + '</span></div>';
-  });
+    return;
+  }
+
+  if (data.status === 'paid' && data.result) {
+    stopPolling();
+    if (activeService === 'resume_ai') {
+      generateAIResume();
+    } else {
+      renderStep3(data.result);
+    }
+    return;
+  }
+
+  if (!silent) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
+    var msg = data.message || 'Payment not yet detected.';
+    if (statusEl) statusEl.innerHTML = '<div class="warn-box"><span>⏳</span><span>' + escHtml(msg) + '</span></div>';
+  }
+  if (waitEl && data.processor_status) {
+    waitEl.innerHTML = '<span>⏳</span><span>Status: ' + escHtml(data.processor_status) + '. Checking automatically every 10 seconds…</span>';
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -1550,13 +1748,13 @@ function generateAIResume() {
   fetch('/api/generate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(formPayload)
+    body: JSON.stringify(Object.assign({order_id: currentOrder ? currentOrder.order_id : null}, formPayload))
   })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) throw new Error(data.error);
-    aiResult = data;
-    renderStep3({ai_result: data});
+  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
+  .then(function(res) {
+    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
+    aiResult = res.data;
+    renderStep3({ai_result: res.data});
   })
   .catch(function(err) {
     var statusEl = document.getElementById('verify-status');
@@ -1832,131 +2030,212 @@ def list_emails():
         return jsonify({"error": "Unauthorized"}), 401
     return jsonify({"count": count_emails(), "emails": list_all_emails()})
 
+def compute_result_for_service(service, payload):
+    """
+    Runs the appropriate deterministic tool for a paid order. resume_ai is
+    handled separately (see /api/generate) because it needs a live AI call
+    that's gated on the order actually being paid.
+    """
+    if service == "resume_optimizer":
+        return run_resume_optimizer(
+            payload.get("resume_text", ""),
+            payload.get("job_title", "Professional"),
+            payload.get("industry", "tech"),
+        )
+    elif service == "resume_ai":
+        return {"requires_ai_generation": True}
+    elif service == "interview":
+        return run_interview_prep(
+            payload.get("job_title", "Professional"),
+            payload.get("experience", "mid"),
+            payload.get("company", "the company"),
+        )
+    elif service == "salary":
+        return run_salary_negotiation(
+            int(payload.get("current_salary") or 80000),
+            int(payload.get("years") or 3),
+            payload.get("location", "remote"),
+            payload.get("job_title", "Professional"),
+        )
+    return {}
+
+def settle_order_paid(order_row, tx_hash=None):
+    """Idempotently mark an order paid and compute its result, if not already done."""
+    if order_row["status"] == "paid" and order_row.get("result_json"):
+        return json.loads(order_row["result_json"])
+    payload = json.loads(order_row["payload_json"] or "{}")
+    try:
+        result = compute_result_for_service(order_row["service"], payload)
+    except Exception as exc:
+        result = {"error": str(exc)}
+    db_mark_order_paid(order_row["id"], result, tx_hash=tx_hash)
+    return result
+
 @app.post("/api/orders")
 def create_order():
-    body = request.get_json(silent=True) or {}
-    service = body.get("service", "").strip()
-    coin    = body.get("coin", "").strip()
+    if not payments_configured():
+        return jsonify({
+            "error": "Crypto payments are not configured on this server. "
+                     "Set NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL to accept real payments."
+        }), 503
+
+    body    = request.get_json(silent=True) or {}
+    service = (body.get("service") or "").strip()
+    coin    = (body.get("coin") or "").strip()
 
     if service not in SERVICES:
         return jsonify({"error": f"Unknown service. Valid: {', '.join(SERVICES.keys())}"}), 400
-    if coin not in WALLETS:
+    if coin not in COIN_TO_NOWPAYMENTS_CURRENCY:
         return jsonify({"error": "Unsupported coin. Valid: bitcoin, ethereum, usdc, solana"}), 400
 
-    usd     = SERVICES[service]["price_usd"]
-    amount  = crypto_amount(usd, coin)
-    address = WALLETS[coin]
+    usd      = SERVICES[service]["price_usd"]
     order_id = secrets.token_urlsafe(12)
 
     try:
-        qr_data = generate_qr(address, coin, amount)
+        payment = create_nowpayments_payment(order_id, usd, coin)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    payment_id   = payment.get("payment_id")
+    pay_address  = payment.get("pay_address")
+    pay_amount   = payment.get("pay_amount")
+    pay_currency = payment.get("pay_currency")
+
+    if not payment_id or not pay_address or pay_amount is None:
+        return jsonify({"error": "Payment processor returned an incomplete response"}), 502
+
+    db_create_order(order_id, service, coin, usd, payment_id, pay_address, pay_amount,
+                     pay_currency, body.get("payload") or {})
+
+    try:
+        qr_data = generate_qr(pay_address, coin, pay_amount)
     except Exception:
         qr_data = ""
 
-    _orders[order_id] = {
-        "id":        order_id,
-        "service":   service,
-        "coin":      coin,
-        "usd_amount": usd,
-        "amount":    amount,
-        "address":   address,
-        "status":    "awaiting_payment",
-        "created_at": utcnow(),
-        "payload":   body.get("payload") or {},
-    }
-
     return jsonify({
-        "order_id": order_id,
-        "address":  address,
-        "coin":     coin,
-        "amount":   amount,
-        "usd":      usd,
-        "qr":       qr_data,
+        "order_id":     order_id,
+        "address":      pay_address,
+        "coin":         coin,
+        "pay_currency": pay_currency,
+        "amount":       pay_amount,
+        "usd":          usd,
+        "qr":           qr_data,
     })
 
 @app.post("/api/orders/<order_id>/verify")
 def verify_order(order_id):
-    order = _orders.get(order_id)
-    if not order:
+    """
+    Fallback/manual verification: polls NOWPayments' status API. In normal
+    operation, the webhook below (/api/webhook/nowpayments) already marks
+    the order paid in real time, so this usually just confirms what the
+    webhook already recorded.
+    """
+    order_row = db_get_order(order_id)
+    if not order_row:
         return jsonify({"error": "Order not found"}), 404
 
-    if order["status"] == "paid":
-        return jsonify({
-            "status":        "paid",
-            "confirmations": order.get("confirmations", 1),
-            "result":        order.get("result"),
-        })
+    if order_row["status"] == "paid":
+        result = settle_order_paid(order_row)
+        return jsonify({"status": "paid", "result": result})
 
-    body    = request.get_json(silent=True) or {}
-    tx_hash = body.get("tx_hash")
-    check   = verify_on_chain(order["coin"], order["address"], order["amount"], tx_hash)
-
-    if not check["confirmed"]:
-        return jsonify({
-            "status":        "awaiting_payment",
-            "confirmations": 0,
-            "message":       "Payment not yet detected. Allow 10–30 minutes for network confirmation.",
-        })
-
-    order["status"]        = "paid"
-    order["tx_hash"]       = check["tx_hash"]
-    order["confirmations"] = check["confirmations"]
-    order["paid_at"]       = utcnow()
-
-    svc     = order["service"]
-    payload = order.get("payload") or {}
+    if not payments_configured():
+        return jsonify({"error": "Crypto payments are not configured on this server."}), 503
 
     try:
-        if svc == "resume_optimizer":
-            result = run_resume_optimizer(
-                payload.get("resume_text", ""),
-                payload.get("job_title", "Professional"),
-                payload.get("industry", "tech"),
-            )
-        elif svc == "resume_ai":
-            result = {"requires_ai_generation": True}
-        elif svc == "interview":
-            result = run_interview_prep(
-                payload.get("job_title", "Professional"),
-                payload.get("experience", "mid"),
-                payload.get("company", "the company"),
-            )
-        elif svc == "salary":
-            result = run_salary_negotiation(
-                int(payload.get("current_salary") or 80000),
-                int(payload.get("years") or 3),
-                payload.get("location", "remote"),
-                payload.get("job_title", "Professional"),
-            )
-        else:
-            result = {}
+        status_resp = get_nowpayments_status(order_row["payment_id"])
     except Exception as exc:
-        result = {"error": str(exc)}
+        return jsonify({"error": str(exc)}), 502
 
-    order["result"] = result
+    processor_status = status_resp.get("payment_status", "waiting")
+    tx_hash = status_resp.get("payin_hash")
+
+    if processor_status in PAID_STATUSES:
+        order_row = db_get_order(order_id)  # re-fetch in case the webhook just landed
+        result = settle_order_paid(order_row, tx_hash=tx_hash)
+        return jsonify({"status": "paid", "result": result, "processor_status": processor_status})
+
+    if processor_status in DEAD_STATUSES:
+        db_update_order_status(order_id, processor_status)
+        return jsonify({
+            "status": "failed",
+            "processor_status": processor_status,
+            "message": f"This payment {processor_status} and cannot be completed. Please start a new order.",
+        })
+
+    db_update_order_status(order_id, processor_status)
     return jsonify({
-        "status":        "paid",
-        "confirmations": check["confirmations"],
-        "result":        result,
+        "status": "waiting",
+        "processor_status": processor_status,
+        "message": "Payment not yet detected. Crypto confirmations can take several minutes depending on network congestion.",
     })
+
+@app.post("/api/webhook/nowpayments")
+def nowpayments_webhook():
+    """
+    Real-time payment confirmation. NOWPayments calls this URL whenever a
+    payment's status changes. The HMAC-SHA512 signature is verified before
+    trusting anything in the body — this is the actual proof-of-payment
+    check that replaces the old `random.random() > 0.10` stub.
+    """
+    signature = request.headers.get("x-nowpayments-sig", "")
+    body = request.get_json(silent=True) or {}
+
+    if not verify_nowpayments_signature(body, signature):
+        return jsonify({"error": "Invalid signature"}), 401
+
+    order_id       = body.get("order_id")
+    payment_status = body.get("payment_status")
+    tx_hash        = body.get("payin_hash")
+
+    if not order_id:
+        return jsonify({"error": "Missing order_id"}), 400
+
+    order_row = db_get_order(order_id)
+    if not order_row:
+        return jsonify({"error": "Unknown order_id"}), 404
+
+    if payment_status in PAID_STATUSES:
+        settle_order_paid(order_row, tx_hash=tx_hash)
+    elif payment_status:
+        db_update_order_status(order_id, payment_status, tx_hash=tx_hash)
+
+    return jsonify({"ok": True})
 
 @app.get("/api/orders/<order_id>")
 def get_order(order_id):
-    order = _orders.get(order_id)
-    if not order:
+    order_row = db_get_order(order_id)
+    if not order_row:
         return jsonify({"error": "Order not found"}), 404
-    safe = {k: v for k, v in order.items() if k != "payload"}
+    safe = {k: v for k, v in order_row.items() if k not in ("payload_json", "result_json")}
     return jsonify(safe)
 
 @app.post("/api/generate")
 def generate():
-    body   = request.get_json(silent=True) or {}
-    name   = (body.get("name")   or "").strip()
-    skills = (body.get("skills") or "").strip()
+    """
+    Generates the AI resume + cover letter for the resume_ai service. This
+    REQUIRES a paid order_id. Previously this endpoint had no payment check
+    at all, so anyone could call it directly and receive a full AI-written
+    resume + cover letter for free, without ever creating or paying for an
+    order — that hole is closed here.
+    """
+    body     = request.get_json(silent=True) or {}
+    order_id = (body.get("order_id") or "").strip()
+    name     = (body.get("name")   or "").strip()
+    skills   = (body.get("skills") or "").strip()
     job_desc = (body.get("job_desc") or "").strip()
 
+    if not order_id:
+        return jsonify({"error": "order_id is required"}), 400
     if not name:   return jsonify({"error": "Name is required"}), 400
     if not skills: return jsonify({"error": "Skills are required"}), 400
+
+    order_row = db_get_order(order_id)
+    if not order_row:
+        return jsonify({"error": "Order not found"}), 404
+    if order_row["service"] != "resume_ai":
+        return jsonify({"error": "This order is not for the AI Resume Generator"}), 400
+    if order_row["status"] != "paid":
+        return jsonify({"error": "This order has not been paid yet"}), 402
 
     try:
         resume_text = call_claude(build_resume_prompt(name, skills, job_desc))
@@ -1997,7 +2276,14 @@ def download_file(filename):
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "orders": len(_orders), "ai_results": len(_ai_results), "emails": count_emails()})
+    return jsonify({
+        "status": "ok",
+        "orders": count_orders(),
+        "ai_results": len(_ai_results),
+        "emails": count_emails(),
+        "payments_configured": payments_configured(),
+        "ai_generation_configured": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
+    })
 
 # ── SEO LANDING PAGES ────────────────────────────────────────────────────────
 @app.get("/ats-resume-checker")
@@ -2072,8 +2358,14 @@ if __name__ == "__main__":
     print("─" * 60)
     print("  CareerForge Pro  ·  http://localhost:5000")
     print("─" * 60)
-    for k, v in WALLETS.items():
-        print(f"  {k.upper():<10} {v}")
+    if payments_configured():
+        print("  Crypto payments: NOWPayments (LIVE)")
+    else:
+        print("  Crypto payments: NOT CONFIGURED — set NOWPAYMENTS_API_KEY + PUBLIC_BASE_URL")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print("  AI resume generation: configured")
+    else:
+        print("  AI resume generation: NOT CONFIGURED — set ANTHROPIC_API_KEY")
     print("─" * 60)
     for svc, info in SERVICES.items():
         print(f"    • {info['name']} (${info['price_usd']})")
@@ -2084,7 +2376,4 @@ if __name__ == "__main__":
     print("  Free ATS score + email capture: paste text OR upload PDF/DOCX/TXT")
     print("  Admin emails: GET /api/emails?secret=<ADMIN_SECRET>")
     print("─" * 60)
-    print("  Set ANTHROPIC_API_KEY for AI resume generation")
-    print("─" * 60)
-    print()
     app.run(debug=False, host="0.0.0.0", port=5000)
