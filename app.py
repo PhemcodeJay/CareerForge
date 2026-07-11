@@ -46,7 +46,7 @@ SERVICES = {
 CRYPTO_PRICES_USD = {
     "bitcoin":  65000,
     "ethereum": 3500,
-    "usdc":     1.0,
+    "usdt":     1.0,  # Changed from USDC to USDT
     "solana":   150,
 }
 # NOTE: CRYPTO_PRICES_USD is only used to show a rough "approx amount" estimate
@@ -80,15 +80,12 @@ NOWPAYMENTS_BASE_URL    = (
     else "https://api.nowpayments.io/v1"
 )
 
-# Map our internal coin names to NOWPayments currency codes. USDC in
-# particular has several network variants (usdcerc20, usdcsol, usdcmatic,
-# usdctrc20, ...) -- confirm the exact code you want against
-# GET {NOWPAYMENTS_BASE_URL}/currencies before going live, since NOWPayments
-# updates these periodically.
+# Map our internal coin names to NOWPayments currency codes.
+# USDT (TRC20) is the correct code for USDT on the TRON network
 COIN_TO_NOWPAYMENTS_CURRENCY = {
     "bitcoin":  "btc",
     "ethereum": "eth",
-    "usdc":     "usdcerc20",
+    "usdt":     "usdttrc20",  # Changed from usdcerc20 to usdttrc20
     "solana":   "sol",
 }
 
@@ -119,6 +116,12 @@ def _nowpayments_request(method, path, body=None):
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
+        # Better error handling for 403 errors
+        if e.code == 403:
+            raise RuntimeError(
+                f"Payment processor authentication failed (403). "
+                f"Please check your NOWPAYMENTS_API_KEY. Details: {detail}"
+            )
         raise RuntimeError(f"Payment processor error ({e.code}): {detail}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Could not reach payment processor: {e.reason}")
@@ -132,6 +135,9 @@ def create_nowpayments_payment(internal_order_id, usd_amount, coin):
             "PUBLIC_BASE_URL is not configured. NOWPayments needs a public "
             "HTTPS URL to send its payment-confirmation webhook to."
         )
+    
+    # NOWPayments API expects the pay_currency in the format they recognize
+    # For USDT TRC20, it should be 'usdttrc20'
     body = {
         "price_amount":      usd_amount,
         "price_currency":    "usd",
@@ -349,7 +355,7 @@ def generate_qr(address, coin, amount):
     uri_map = {
         "bitcoin":  f"bitcoin:{address}?amount={amount}",
         "ethereum": f"ethereum:{address}?value={amount}",
-        "usdc":     address,
+        "usdt":     address,  # TRC20 addresses use simple address format
         "solana":   f"solana:{address}?amount={amount}",
     }
     uri = uri_map.get(coin, address)
@@ -754,7 +760,7 @@ def seo_page(title, headline, subheadline, description, cta_label, cta_service):
 <div class="features">
   <div class="feat"><div class="feat-icon">⚡</div><div class="feat-title">Instant results</div><div class="feat-desc">Get your score and recommendations in seconds, not hours.</div></div>
   <div class="feat"><div class="feat-icon">🎯</div><div class="feat-title">ATS-optimized</div><div class="feat-desc">Built to pass the applicant tracking systems used by 99% of Fortune 500 companies.</div></div>
-  <div class="feat"><div class="feat-icon">🔒</div><div class="feat-title">Pay with crypto</div><div class="feat-desc">Bitcoin, Ethereum, USDC, or Solana. No credit card needed, no personal data stored.</div></div>
+  <div class="feat"><div class="feat-icon">🔒</div><div class="feat-title">Pay with crypto</div><div class="feat-desc">Bitcoin, Ethereum, USDT, or Solana. No credit card needed, no personal data stored.</div></div>
 </div>
 <footer>
   <a href="/">CareerForge Pro</a> — AI-powered career tools · 
@@ -776,7 +782,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CareerForge Pro — Get More Interviews With an ATS-Optimized Resume</title>
-  <meta name="description" content="Upload your resume, get AI-powered ATS scoring, keyword analysis, and job-specific improvements in seconds. Pay with Bitcoin, Ethereum, USDC, or Solana.">
+  <meta name="description" content="Upload your resume, get AI-powered ATS scoring, keyword analysis, and job-specific improvements in seconds. Pay with Bitcoin, Ethereum, USDT, or Solana.">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
@@ -1033,7 +1039,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     <div class="coins-strip">
       <div class="coin-chip"><div class="cdot" style="background:#f7931a"></div>Bitcoin</div>
       <div class="coin-chip"><div class="cdot" style="background:#627eea"></div>Ethereum</div>
-      <div class="coin-chip"><div class="cdot" style="background:#2775ca"></div>USDC</div>
+      <div class="coin-chip"><div class="cdot" style="background:#26A17B"></div>USDT</div>
       <div class="coin-chip"><div class="cdot" style="background:#9945ff"></div>Solana</div>
     </div>
   </section>
@@ -1165,12 +1171,12 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
           <li><span class="fcheck">✓</span>Lifetime access</li>
           <li><span class="fcheck">✓</span>All future tools</li>
           <li><span class="fcheck">✓</span>Priority support</li>
-          <li><span class="fcheck">✓</span>BTC, ETH, USDC, SOL accepted</li>
+          <li><span class="fcheck">✓</span>BTC, ETH, USDT, SOL accepted</li>
         </ul>
         <button class="btn-plan" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Get lifetime access →</button>
       </div>
     </div>
-    <div class="crypto-note">Pay with Bitcoin, Ethereum, USDC, or Solana. No credit card, no personal data stored.</div>
+    <div class="crypto-note">Pay with Bitcoin, Ethereum, USDT, or Solana. No credit card, no personal data stored.</div>
   </div>
 </div>
 
@@ -1182,7 +1188,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     </div>
     <div class="how-grid">
       <div><div class="how-n">01</div><div class="how-l">Fill out your details or paste your resume</div></div>
-      <div><div class="how-n">02</div><div class="how-l">Pay with BTC, ETH, USDC, or SOL</div></div>
+      <div><div class="how-n">02</div><div class="how-l">Pay with BTC, ETH, USDT, or SOL</div></div>
       <div><div class="how-n">03</div><div class="how-l">Get your results + downloadable PDF</div></div>
     </div>
   </div>
@@ -1251,17 +1257,17 @@ var SERVICE_PRICES = {resume_ai:49,resume_optimizer:49,interview:29,salary:19};
 var COINS = {
   bitcoin:  {label:'Bitcoin',  ticker:'BTC',  color:'#f7931a', logo:'₿'},
   ethereum: {label:'Ethereum', ticker:'ETH',  color:'#627eea', logo:'Ξ'},
-  usdc:     {label:'USDC',     ticker:'USDC', color:'#2775ca', logo:'$'},
+  usdt:     {label:'USDT',     ticker:'USDT', color:'#26A17B', logo:'$'},
   solana:   {label:'Solana',   ticker:'SOL',  color:'#9945ff', logo:'◎'}
 };
-var APPROX_PRICES = {bitcoin:65000,ethereum:3500,usdc:1,solana:150};
+var APPROX_PRICES = {bitcoin:65000,ethereum:3500,usdt:1,solana:150};
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
 function approxAmt(usd, coin) {
   var amt = usd / APPROX_PRICES[coin];
-  return coin === 'usdc' ? amt.toFixed(2) : amt.toFixed(8);
+  return coin === 'usdt' ? amt.toFixed(2) : amt.toFixed(8);
 }
 
 function escHtml(str) {
@@ -2086,7 +2092,7 @@ def create_order():
     if service not in SERVICES:
         return jsonify({"error": f"Unknown service. Valid: {', '.join(SERVICES.keys())}"}), 400
     if coin not in COIN_TO_NOWPAYMENTS_CURRENCY:
-        return jsonify({"error": "Unsupported coin. Valid: bitcoin, ethereum, usdc, solana"}), 400
+        return jsonify({"error": "Unsupported coin. Valid: bitcoin, ethereum, usdt, solana"}), 400
 
     usd      = SERVICES[service]["price_usd"]
     order_id = secrets.token_urlsafe(12)
