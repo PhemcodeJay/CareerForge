@@ -3,10 +3,6 @@ import secrets
 import re
 import json
 import uuid
-import urllib.request
-import urllib.error
-import hashlib
-import hmac
 import sqlite3
 from io import BytesIO
 from datetime import datetime, timezone
@@ -37,131 +33,11 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 SERVICES = {
-    "resume_ai":        {"name": "AI Resume Generator",  "price_usd": 49},
-    "resume_optimizer": {"name": "Resume Optimizer",     "price_usd": 49},
-    "interview":        {"name": "Interview Prep",       "price_usd": 29},
-    "salary":           {"name": "Salary Negotiator",    "price_usd": 19},
+    "resume_ai":        {"name": "AI Resume Generator",  "price_usd": 49, "button_id": "5845718217"},
+    "resume_optimizer": {"name": "Resume Optimizer",     "price_usd": 49, "button_id": "5845718217"},
+    "interview":        {"name": "Interview Prep",       "price_usd": 29, "button_id": "4562067378"},
+    "salary":           {"name": "Salary Negotiator",    "price_usd": 19, "button_id": "6108015880"},
 }
-
-CRYPTO_PRICES_USD = {
-    "bitcoin":  65000,
-    "ethereum": 3500,
-    "usdt":     1.0,  # Changed from USDC to USDT
-    "solana":   150,
-}
-# NOTE: CRYPTO_PRICES_USD is only used to show a rough "approx amount" estimate
-# on the coin-selection screen BEFORE an order is created. The real amount a
-# customer must pay is whatever NOWPayments returns when the order is
-# created below -- that is the number actually enforced.
-
-# ============================================================================
-# REAL CRYPTO PAYMENTS via NOWPayments
-# ----------------------------------------------------------------------------
-# Why a payment processor instead of a single static address per coin:
-# every order needs its OWN deposit address, or there is no reliable way to
-# tell which customer paid which invoice. NOWPayments (or an equivalent
-# processor such as Coinbase Commerce / BTCPay Server) generates a unique
-# address per payment and tells us, via webhook plus a status API, when it
-# has actually been paid.
-#
-# Required environment variables:
-#   NOWPAYMENTS_API_KEY    - from your NOWPayments dashboard
-#   NOWPAYMENTS_IPN_SECRET - IPN secret key, used to verify webhook signatures
-#   PUBLIC_BASE_URL        - e.g. https://careerforge-pm1q.onrender.com
-#                            (NOWPayments must be able to reach this URL)
-#   NOWPAYMENTS_SANDBOX    - set to "true" to use the sandbox API while testing
-# ============================================================================
-NOWPAYMENTS_API_KEY    = os.environ.get("NOWPAYMENTS_API_KEY", "")
-NOWPAYMENTS_IPN_SECRET  = os.environ.get("NOWPAYMENTS_IPN_SECRET", "")
-PUBLIC_BASE_URL         = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-NOWPAYMENTS_BASE_URL    = (
-    "https://api-sandbox.nowpayments.io/v1"
-    if os.environ.get("NOWPAYMENTS_SANDBOX", "").strip().lower() in ("1", "true", "yes")
-    else "https://api.nowpayments.io/v1"
-)
-
-# Map our internal coin names to NOWPayments currency codes.
-# USDT (TRC20) is the correct code for USDT on the TRON network
-COIN_TO_NOWPAYMENTS_CURRENCY = {
-    "bitcoin":  "btc",
-    "ethereum": "eth",
-    "usdt":     "usdttrc20",  # Changed from usdcerc20 to usdttrc20
-    "solana":   "sol",
-}
-
-# Terminal NOWPayments statuses we treat as "customer has genuinely paid".
-PAID_STATUSES = {"confirmed", "finished"}
-# Statuses that mean the payment is dead and won't become paid.
-DEAD_STATUSES = {"failed", "refunded", "expired"}
-
-def payments_configured():
-    return bool(NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL)
-
-def _nowpayments_request(method, path, body=None):
-    if not NOWPAYMENTS_API_KEY:
-        raise RuntimeError(
-            "Crypto payments are not configured on this server "
-            "(missing NOWPAYMENTS_API_KEY). No payment can be created or verified."
-        )
-    url = f"{NOWPAYMENTS_BASE_URL}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="ignore")
-        # Better error handling for 403 errors
-        if e.code == 403:
-            raise RuntimeError(
-                f"Payment processor authentication failed (403). "
-                f"Please check your NOWPAYMENTS_API_KEY. Details: {detail}"
-            )
-        raise RuntimeError(f"Payment processor error ({e.code}): {detail}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Could not reach payment processor: {e.reason}")
-
-def create_nowpayments_payment(internal_order_id, usd_amount, coin):
-    pay_currency = COIN_TO_NOWPAYMENTS_CURRENCY.get(coin)
-    if not pay_currency:
-        raise RuntimeError(f"Unsupported coin: {coin}")
-    if not PUBLIC_BASE_URL:
-        raise RuntimeError(
-            "PUBLIC_BASE_URL is not configured. NOWPayments needs a public "
-            "HTTPS URL to send its payment-confirmation webhook to."
-        )
-    
-    # NOWPayments API expects the pay_currency in the format they recognize
-    # For USDT TRC20, it should be 'usdttrc20'
-    body = {
-        "price_amount":      usd_amount,
-        "price_currency":    "usd",
-        "pay_currency":      pay_currency,
-        "order_id":          internal_order_id,
-        "order_description": "CareerForge Pro purchase",
-        "ipn_callback_url":  f"{PUBLIC_BASE_URL}/api/webhook/nowpayments",
-    }
-    return _nowpayments_request("POST", "/payment", body)
-
-def get_nowpayments_status(payment_id):
-    return _nowpayments_request("GET", f"/payment/{payment_id}")
-
-def verify_nowpayments_signature(payload_dict, signature_header):
-    """
-    NOWPayments signs IPN callbacks with HMAC-SHA512 over the JSON body
-    with its keys sorted alphabetically. Reject anything that doesn't match
-    -- this is what actually stops someone from forging a fake "paid" webhook.
-    """
-    if not NOWPAYMENTS_IPN_SECRET or not signature_header:
-        return False
-    ordered = json.dumps(payload_dict, sort_keys=True, separators=(",", ":"))
-    computed = hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), ordered.encode(), hashlib.sha512).hexdigest()
-    return hmac.compare_digest(computed, signature_header)
 
 INDUSTRY_KEYWORDS = {
     "tech":       ["Python", "JavaScript", "AWS", "Agile", "REST API", "Git", "React", "Docker", "Kubernetes", "CI/CD"],
@@ -185,9 +61,7 @@ LOCATION_MULT = {
 _ai_results = {}
 
 # ============================================================================
-# PERSISTENT STORAGE (SQLite) — survives restarts/redeploys as long as the
-# disk is persistent. On Render free tier the filesystem resets on redeploy,
-# so for a permanent list, attach a Render Disk mounted at DB_DIR.
+# PERSISTENT STORAGE (SQLite)
 # ============================================================================
 DB_DIR  = os.environ.get("DB_DIR", os.path.dirname(__file__))
 DB_PATH = os.path.join(DB_DIR, "careerforge.db")
@@ -215,19 +89,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS orders (
             id              TEXT PRIMARY KEY,
             service         TEXT NOT NULL,
-            coin            TEXT NOT NULL,
-            usd_amount      REAL NOT NULL,
-            payment_id      TEXT,
-            pay_address     TEXT,
-            pay_amount      REAL,
-            pay_currency    TEXT,
-            status          TEXT DEFAULT 'waiting',
+            button_id       TEXT NOT NULL,
+            status          TEXT DEFAULT 'pending',
             payload_json    TEXT,
             result_json     TEXT,
-            tx_hash         TEXT,
             created_at      TEXT NOT NULL,
-            updated_at      TEXT NOT NULL,
-            paid_at         TEXT
+            updated_at      TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -235,16 +102,14 @@ def init_db():
 
 init_db()
 
-def db_create_order(order_id, service, coin, usd_amount, payment_id, pay_address, pay_amount, pay_currency, payload):
+def db_create_order(order_id, service, button_id, payload):
     now = utcnow()
     conn = get_db()
     try:
         conn.execute("""
-            INSERT INTO orders (id, service, coin, usd_amount, payment_id, pay_address, pay_amount,
-                                 pay_currency, status, payload_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)
-        """, (order_id, service, coin, usd_amount, payment_id, pay_address, pay_amount,
-              pay_currency, json.dumps(payload or {}), now, now))
+            INSERT INTO orders (id, service, button_id, status, payload_json, created_at, updated_at)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?)
+        """, (order_id, service, button_id, json.dumps(payload or {}), now, now))
         conn.commit()
     finally:
         conn.close()
@@ -257,32 +122,12 @@ def db_get_order(order_id):
     finally:
         conn.close()
 
-def db_get_order_by_payment_id(payment_id):
-    conn = get_db()
-    try:
-        row = conn.execute("SELECT * FROM orders WHERE payment_id = ?", (payment_id,)).fetchone()
-        return dict(row) if row else None
-    finally:
-        conn.close()
-
-def db_update_order_status(order_id, status, tx_hash=None):
+def db_update_order_status(order_id, status, result=None):
     conn = get_db()
     try:
         conn.execute(
-            "UPDATE orders SET status = ?, tx_hash = COALESCE(?, tx_hash), updated_at = ? WHERE id = ?",
-            (status, tx_hash, utcnow(), order_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-def db_mark_order_paid(order_id, result, tx_hash=None):
-    conn = get_db()
-    try:
-        conn.execute(
-            "UPDATE orders SET status = 'paid', result_json = ?, tx_hash = COALESCE(?, tx_hash), "
-            "updated_at = ?, paid_at = ? WHERE id = ?",
-            (json.dumps(result), tx_hash, utcnow(), utcnow(), order_id),
+            "UPDATE orders SET status = ?, result_json = COALESCE(?, result_json), updated_at = ? WHERE id = ?",
+            (status, json.dumps(result) if result else None, utcnow(), order_id),
         )
         conn.commit()
     finally:
@@ -348,25 +193,6 @@ def make_styles():
         "cl_date":      ParagraphStyle("cl_date",      fontName="Helvetica",         fontSize=10,   textColor=LIGHT, spaceAfter=18),
     }
 
-def crypto_amount(usd, coin):
-    return round(usd / CRYPTO_PRICES_USD.get(coin, 1), 8)
-
-def generate_qr(address, coin, amount):
-    uri_map = {
-        "bitcoin":  f"bitcoin:{address}?amount={amount}",
-        "ethereum": f"ethereum:{address}?value={amount}",
-        "usdt":     address,  # TRC20 addresses use simple address format
-        "solana":   f"solana:{address}?amount={amount}",
-    }
-    uri = uri_map.get(coin, address)
-    qr = qrcode.QRCode(version=1, box_size=8, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
-    qr.add_data(uri)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#0f0f0f", back_color="white")
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
@@ -379,6 +205,8 @@ def call_claude(prompt):
             "accepting payment for the AI Resume Generator / Cover Letter tool."
         )
 
+    import urllib.request
+    import json
     payload = json.dumps({
         "model": "claude-3-5-sonnet-20241022",
         "max_tokens": 2500,
@@ -520,10 +348,6 @@ def build_pdf(name, resume_text, cover_letter_text):
     return filename
 
 def extract_text_from_upload(file_storage):
-    """
-    Extract plain text from an uploaded resume file.
-    Supports .pdf, .docx, .txt. Returns (text, error_message_or_None).
-    """
     filename = (file_storage.filename or "").lower()
     data = file_storage.read()
 
@@ -774,7 +598,7 @@ def seo_page(title, headline, subheadline, description, cta_label, cta_service):
 </html>'''
 
 # ============================================================================
-# FRONTEND HTML  (upgraded — with file upload for free ATS score)
+# FRONTEND HTML (simplified - no payment API calls)
 # ============================================================================
 FRONTEND_HTML = r'''<!DOCTYPE html>
 <html lang="en">
@@ -807,7 +631,6 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .btn-nav{background:var(--accent);color:#fff;border:none;padding:8px 20px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
     .btn-nav:hover{opacity:.9;transform:translateY(-1px)}
 
-    /* ── HERO ── */
     .hero{padding:140px 0 72px;text-align:center;position:relative}
     .hero-glow{position:absolute;top:-80px;left:50%;transform:translateX(-50%);width:600px;height:400px;background:radial-gradient(ellipse,rgba(124,110,234,.15) 0%,transparent 70%);pointer-events:none}
     .eyebrow{display:inline-flex;align-items:center;gap:8px;background:rgba(124,110,234,.1);border:1px solid rgba(124,110,234,.25);color:var(--accent2);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:5px 14px;border-radius:var(--r99);margin-bottom:28px}
@@ -824,13 +647,11 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .coin-chip{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--b1);padding:8px 16px;border-radius:var(--r99);font-size:13px;font-weight:500;color:var(--muted)}
     .cdot{width:10px;height:10px;border-radius:50%}
 
-    /* ── STATS ── */
     .stats{display:flex;justify-content:center;background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);margin:40px 0}
     .stat{flex:1;max-width:220px;text-align:center;padding:32px 20px}
     .stat-n{font-family:var(--display);font-size:32px;font-weight:700}
     .stat-l{font-size:13px;color:var(--muted);margin-top:4px}
 
-    /* ── EMAIL CAPTURE BAND ── */
     .capture-band{background:linear-gradient(135deg,rgba(124,110,234,.12) 0%,rgba(192,132,252,.08) 100%);border-top:1px solid rgba(124,110,234,.2);border-bottom:1px solid rgba(124,110,234,.2);padding:48px 0}
     .capture-inner{max-width:560px;margin:0 auto;text-align:center;padding:0 24px}
     .capture-inner h2{font-family:var(--display);font-size:26px;font-weight:700;margin-bottom:10px}
@@ -842,14 +663,13 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .btn-capture:hover{background:var(--accent2)}
     .capture-note{font-size:11px;color:var(--dim);margin-top:12px}
 
-    /* ── SERVICES ── */
     .section{padding:80px 0}
     .sec-head{text-align:center;margin-bottom:60px}
     .sec-ey{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent2);margin-bottom:16px}
     .sec-title{font-family:var(--display);font-size:clamp(28px,4vw,44px);font-weight:700;letter-spacing:-.02em;margin-bottom:16px}
     .sec-sub{font-size:17px;color:var(--muted);max-width:520px;margin:0 auto;line-height:1.6}
     .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}
-    .card{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;cursor:pointer;transition:all .25s;position:relative}
+    .card{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;transition:all .25s;position:relative}
     .card:hover{border-color:rgba(124,110,234,.4);transform:translateY(-4px);box-shadow:0 20px 40px rgba(0,0,0,.4)}
     .card.hot{border-color:rgba(124,110,234,.35);background:linear-gradient(135deg,rgba(124,110,234,.06) 0%,var(--bg3) 100%)}
     .hot-badge{position:absolute;top:18px;right:18px;background:rgba(124,110,234,.18);color:var(--accent2);font-size:10px;font-weight:700;padding:4px 10px;border-radius:var(--r99);border:1px solid rgba(124,110,234,.3)}
@@ -864,7 +684,6 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .btn-card{width:100%;background:rgba(124,110,234,.12);color:var(--accent2);border:1px solid rgba(124,110,234,.3);padding:12px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
     .btn-card:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 
-    /* ── PRICING ── */
     .pricing-section{background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);padding:80px 0}
     .pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px;max-width:860px;margin:0 auto}
     .plan{background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;position:relative;transition:all .25s}
@@ -882,13 +701,12 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .btn-plan.accent:hover{background:var(--accent2);border-color:var(--accent2)}
     .crypto-note{text-align:center;font-size:12px;color:var(--dim);margin-top:20px}
 
-    /* ── HOW ── */
     .how-section{background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);padding:70px 0;text-align:center}
     .how-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:48px;max-width:800px;margin:0 auto}
     .how-n{font-family:var(--display);font-size:36px;font-weight:700;color:var(--accent2);margin-bottom:8px}
     .how-l{font-size:15px;color:var(--muted);line-height:1.5}
 
-    /* ── MODAL ── */
+    /* Modal */
     .overlay{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.85);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;padding:20px;opacity:0;pointer-events:none;transition:opacity .25s}
     .overlay.open{opacity:1;pointer-events:auto}
     .modal{background:var(--bg2);border:1px solid var(--b2);border-radius:var(--r24);width:100%;max-width:580px;max-height:90vh;overflow-y:auto;transform:translateY(16px) scale(.98);transition:transform .25s}
@@ -922,26 +740,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .step.done .snum{background:rgba(52,211,153,.12);border-color:rgba(52,211,153,.35);color:var(--green)}
     .slabel{font-size:11px;color:var(--muted);font-weight:500}
     .step.active .slabel,.step.done .slabel{color:var(--txt)}
-    .coin-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
-    .coin-opt{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r12);padding:14px;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:12px}
-    .coin-opt:hover{border-color:var(--b2)}
-    .coin-opt.sel{border-color:var(--accent);background:rgba(124,110,234,.08)}
-    .clogo{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;flex-shrink:0}
-    .cname{font-size:14px;font-weight:600}
-    .camt{font-size:11px;color:var(--muted);margin-top:2px}
-    .pay-box{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r16);padding:24px;text-align:center;margin-bottom:20px}
-    .qr-wrap{width:160px;height:160px;background:#fff;border-radius:var(--r8);padding:8px;margin:0 auto 20px;display:flex;align-items:center;justify-content:center}
-    .qr-wrap img{width:100%;height:100%;display:block}
-    .pay-amt{font-family:var(--display);font-size:28px;font-weight:700;margin-bottom:6px}
-    .pay-usd{font-size:13px;color:var(--muted);margin-bottom:16px}
-    .addr-box{background:var(--bg);border:1px solid var(--b1);border-radius:var(--r8);padding:12px;display:flex;align-items:center;gap:12px;text-align:left}
-    .addr-text{font-family:monospace;font-size:11px;color:var(--muted);word-break:break-all;flex:1;min-width:0}
-    .copy-btn{background:var(--bg3);border:1px solid var(--b1);color:var(--muted);padding:6px 12px;border-radius:var(--r4);font-size:11px;cursor:pointer;transition:all .2s;white-space:nowrap;flex-shrink:0}
-    .copy-btn:hover{color:var(--txt);border-color:var(--b2)}
-    .copy-btn.copied{color:var(--green);border-color:rgba(52,211,153,.3)}
-    .warn-box{background:rgba(230,180,74,.08);border:1px solid rgba(230,180,74,.2);border-radius:var(--r8);padding:14px;font-size:12px;color:rgba(230,180,74,.85);line-height:1.55;margin-bottom:16px;display:flex;gap:10px}
-    .info-box{background:rgba(124,110,234,.08);border:1px solid rgba(124,110,234,.2);border-radius:var(--r8);padding:14px;font-size:12px;color:rgba(160,140,240,.9);margin-bottom:16px;display:flex;gap:10px}
-    .err-box{background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.2);border-radius:var(--r8);padding:14px;font-size:12px;color:var(--red);margin-bottom:16px;display:flex;gap:10px}
+
     .rsec{margin-bottom:28px}
     .rsec-title{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);margin-bottom:12px}
     .score-wrap{display:flex;align-items:center;gap:24px;margin-bottom:20px}
@@ -981,12 +780,10 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .spin-accent{border-color:var(--b1);border-top-color:var(--accent)}
     @keyframes spin{to{transform:rotate(360deg)}}
 
-    /* ── EMAIL CAPTURE MODAL ── */
     .free-score-box{background:rgba(52,211,153,.05);border:1px solid rgba(52,211,153,.2);border-radius:var(--r16);padding:24px;text-align:center;margin-bottom:20px}
     .free-score-box h3{font-family:var(--display);font-size:18px;margin-bottom:8px}
     .free-score-box p{font-size:13px;color:var(--muted);margin-bottom:20px;line-height:1.55}
 
-    /* ── FILE UPLOAD DROPZONE ── */
     .dropzone{border:2px dashed var(--b2);border-radius:var(--r12);padding:28px 16px;text-align:center;cursor:pointer;transition:all .2s;background:var(--bg3)}
     .dropzone:hover,.dropzone.drag{border-color:var(--accent);background:rgba(124,110,234,.06)}
     .dropzone-icon{font-size:28px;margin-bottom:8px}
@@ -1247,28 +1044,16 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
 // ─────────────────────────────────────────────
 var activeService = null;
 var formPayload = {};
-var currentOrder = null;
 var aiResult = null;
 var fcSelectedFile = null;
-var pollTimer = null;
 
-var SERVICE_NAMES  = {resume_ai:'AI Resume Generator',resume_optimizer:'Resume Optimizer',interview:'Interview Prep',salary:'Salary Negotiator'};
-var SERVICE_PRICES = {resume_ai:49,resume_optimizer:49,interview:29,salary:19};
-var COINS = {
-  bitcoin:  {label:'Bitcoin',  ticker:'BTC',  color:'#f7931a', logo:'₿'},
-  ethereum: {label:'Ethereum', ticker:'ETH',  color:'#627eea', logo:'Ξ'},
-  usdt:     {label:'USDT',     ticker:'USDT', color:'#26A17B', logo:'$'},
-  solana:   {label:'Solana',   ticker:'SOL',  color:'#9945ff', logo:'◎'}
+var SERVICE_NAMES = {resume_ai:'AI Resume Generator',resume_optimizer:'Resume Optimizer',interview:'Interview Prep',salary:'Salary Negotiator'};
+var SERVICE_BUTTONS = {
+  resume_ai: '5845718217',
+  resume_optimizer: '5845718217',
+  interview: '4562067378',
+  salary: '6108015880'
 };
-var APPROX_PRICES = {bitcoin:65000,ethereum:3500,usdt:1,solana:150};
-
-// ─────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────
-function approxAmt(usd, coin) {
-  var amt = usd / APPROX_PRICES[coin];
-  return coin === 'usdt' ? amt.toFixed(2) : amt.toFixed(8);
-}
 
 function escHtml(str) {
   if (!str) return '';
@@ -1292,12 +1077,8 @@ function fileIconFor(name) {
   return '📄';
 }
 
-function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-}
-
 // ─────────────────────────────────────────────
-// EMAIL CAPTURE  (with file upload)
+// EMAIL CAPTURE
 // ─────────────────────────────────────────────
 function openEmailCapture() {
   document.getElementById('mtitle').textContent = 'Free ATS Resume Score';
@@ -1461,9 +1242,7 @@ function submitEmailCapture() {
 function openModal(svc) {
   activeService = svc;
   formPayload = {};
-  currentOrder = null;
   aiResult = null;
-  stopPolling();
   document.getElementById('mtitle').textContent = SERVICE_NAMES[svc];
   renderStep1();
   document.getElementById('overlay').classList.add('open');
@@ -1474,8 +1253,6 @@ function closeModal() {
   document.getElementById('overlay').classList.remove('open');
   document.body.style.overflow = '';
   activeService = null;
-  currentOrder = null;
-  stopPolling();
 }
 
 function handleOverlayClick(e) {
@@ -1484,7 +1261,7 @@ function handleOverlayClick(e) {
 
 document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
 
-// Auto-open from URL param e.g. ?open=resume_ai
+// Auto-open from URL param
 (function() {
   var p = new URLSearchParams(window.location.search);
   var svc = p.get('open');
@@ -1563,198 +1340,74 @@ function submitStep1() {
     if (btn) { btn.disabled = false; btn.textContent = 'Continue to payment →'; }
     return;
   }
-  renderStep2(null);
+  renderStep2();
 }
 
 // ─────────────────────────────────────────────
-// STEP 2 — COIN SELECTION + PAYMENT
+// STEP 2 — Payment with NOWPayments button
 // ─────────────────────────────────────────────
-function renderStep2(selectedCoin) {
-  var usd = SERVICE_PRICES[activeService];
-  var coinHtml = Object.keys(COINS).map(function(c) {
-    var m = COINS[c];
-    var amt = approxAmt(usd, c);
-    var sel = selectedCoin === c ? ' sel' : '';
-    return '<div class="coin-opt' + sel + '" id="coin-' + c + '" onclick="selectCoin(\'' + c + '\')">' +
-           '<div class="clogo" style="background:' + m.color + '22;color:' + m.color + '">' + m.logo + '</div>' +
-           '<div><div class="cname">' + m.label + '</div><div class="camt">≈ ' + amt + ' ' + m.ticker + ' (estimate)</div></div>' +
-           '</div>';
-  }).join('');
-
+function renderStep2() {
+  var buttonId = SERVICE_BUTTONS[activeService];
+  var priceMap = {resume_ai:49, resume_optimizer:49, interview:29, salary:19};
+  var price = priceMap[activeService] || 0;
+  
   setBody(
     '<div class="steps">' + stepsHtml(1) + '</div>' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">' +
       '<div style="font-size:14px;color:var(--muted)">Total due</div>' +
-      '<div style="font-family:var(--display);font-size:28px;font-weight:700">$' + usd + '</div>' +
+      '<div style="font-family:var(--display);font-size:28px;font-weight:700">$' + price + '</div>' +
     '</div>' +
-    '<div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em">Choose your currency</div>' +
-    '<div class="coin-grid">' + coinHtml + '</div>' +
-    '<div id="pay-detail"></div>' +
+    '<div style="text-align:center;padding:20px 0">' +
+      '<p style="color:var(--muted);margin-bottom:20px">Click the button below to pay with cryptocurrency</p>' +
+      '<a href="https://nowpayments.io/payment/?iid=' + buttonId + '&source=button" target="_blank" rel="noreferrer noopener" style="display:inline-block">' +
+        '<img src="https://nowpayments.io/images/embeds/payments-button-white.svg" alt="Pay with Cryptocurrency via NOWPayments" style="max-width:200px;width:100%;height:auto">' +
+      '</a>' +
+      '<div style="margin-top:20px;font-size:12px;color:var(--dim)">Pay with Bitcoin, Ethereum, USDT, or Solana</div>' +
+    '</div>' +
+    '<div class="divider"></div>' +
+    '<div style="text-align:center">' +
+      '<div style="font-size:13px;color:var(--muted);margin-bottom:12px">After payment, come back here and click below to get your results</div>' +
+      '<button class="btn-full" onclick="processPayment()">I\'ve completed payment →</button>' +
+    '</div>' +
     '<button class="btn-back" onclick="renderStep1()">← Back to details</button>'
   );
 }
 
-function selectCoin(coin) {
-  document.querySelectorAll('.coin-opt').forEach(function(el) { el.classList.remove('sel'); });
-  var el = document.getElementById('coin-' + coin);
-  if (el) el.classList.add('sel');
-  createOrder(coin);
-}
-
-function createOrder(coin) {
-  var el = document.getElementById('pay-detail');
-  if (!el) return;
-  el.innerHTML = '<div style="text-align:center;padding:24px"><div class="spin spin-accent"></div><div style="margin-top:12px;font-size:13px;color:var(--muted)">Creating a unique payment address…</div></div>';
-
+function processPayment() {
+  var btn = document.querySelector('.btn-full');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Processing…'; }
+  
+  // Save order to database
+  var buttonId = SERVICE_BUTTONS[activeService];
   fetch('/api/orders', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({service: activeService, coin: coin, payload: formPayload})
+    body: JSON.stringify({service: activeService, button_id: buttonId, payload: formPayload})
   })
-  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
-  .then(function(res) {
-    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Could not create payment');
-    currentOrder = res.data;
-    renderPayDetail(res.data);
-    startPolling();
-  })
-  .catch(function(err) {
-    if (el) el.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(err.message) + '</span></div>';
-  });
-}
-
-function renderPayDetail(order) {
-  var el = document.getElementById('pay-detail');
-  if (!el) return;
-  var m = COINS[order.coin] || {color:'#7c6eea', ticker:(order.pay_currency || '').toUpperCase()};
-  var qrHtml = order.qr
-    ? '<img src="' + escHtml(order.qr) + '" alt="Payment QR code">'
-    : '<div style="font-size:11px;color:#999;padding:10px">QR unavailable</div>';
-
-  el.innerHTML =
-    '<div class="pay-box">' +
-      '<div class="qr-wrap">' + qrHtml + '</div>' +
-      '<div class="pay-amt" style="color:' + m.color + '">' + escHtml(String(order.amount)) + ' ' + escHtml(m.ticker || '') + '</div>' +
-      '<div class="pay-usd">≈ $' + escHtml(String(order.usd)) + ' USD</div>' +
-      '<div class="addr-box">' +
-        '<div class="addr-text" id="addr-text">' + escHtml(order.address) + '</div>' +
-        '<button class="copy-btn" id="copy-btn" onclick="doCopy()">Copy</button>' +
-      '</div>' +
-    '</div>' +
-    '<div class="warn-box"><span>⚠</span><span>Send <strong>exactly ' + escHtml(String(order.amount)) + ' ' + escHtml(m.ticker || '') + '</strong> to this address. This address is unique to your order — do not reuse it for future payments. Include network fees.</span></div>' +
-    '<div class="info-box" id="wait-status"><span>⏳</span><span>Waiting for payment… this page checks automatically every 10 seconds. You can also click below.</span></div>' +
-    '<button class="btn-full" id="verify-btn" onclick="checkPayment()">Check payment status now →</button>' +
-    '<div id="verify-status" style="margin-top:12px"></div>';
-}
-
-function doCopy() {
-  var addrEl = document.getElementById('addr-text');
-  var btn    = document.getElementById('copy-btn');
-  if (!addrEl || !btn) return;
-  var addr = addrEl.textContent || '';
-  function markCopied() {
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
-  }
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(addr).then(markCopied).catch(function() { fallbackCopy(addr, markCopied); });
-  } else {
-    fallbackCopy(addr, markCopied);
-  }
-}
-
-function fallbackCopy(text, cb) {
-  var ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
-  document.body.appendChild(ta);
-  ta.focus();
-  ta.select();
-  try { document.execCommand('copy'); cb(); } catch(e) {}
-  document.body.removeChild(ta);
-}
-
-// ─────────────────────────────────────────────
-// PAYMENT VERIFICATION (real: polls our backend, which in turn checks
-// the payment processor's status / has already been updated by its webhook)
-// ─────────────────────────────────────────────
-function startPolling() {
-  stopPolling();
-  pollTimer = setInterval(function() {
-    if (!currentOrder) { stopPolling(); return; }
-    pollOnce(true);
-  }, 10000);
-}
-
-function pollOnce(silent) {
-  if (!currentOrder) return;
-  fetch('/api/orders/' + currentOrder.order_id + '/verify', {method: 'POST'})
-    .then(function(r) { return r.json(); })
-    .then(function(data) { handleVerifyResponse(data, silent); })
-    .catch(function() { /* silent polling failures are fine, next tick retries */ });
-}
-
-function checkPayment() {
-  if (!currentOrder) return;
-  var btn      = document.getElementById('verify-btn');
-  var statusEl = document.getElementById('verify-status');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Checking…'; }
-  if (statusEl) statusEl.innerHTML = '';
-
-  fetch('/api/orders/' + currentOrder.order_id + '/verify', {method: 'POST'})
-    .then(function(r) { return r.json(); })
-    .then(function(data) { handleVerifyResponse(data, false); })
-    .catch(function(err) {
-      if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
-      if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(err.message) + '</span></div>';
-    });
-}
-
-function handleVerifyResponse(data, silent) {
-  var btn      = document.getElementById('verify-btn');
-  var statusEl = document.getElementById('verify-status');
-  var waitEl   = document.getElementById('wait-status');
-
-  if (data.error) {
-    if (!silent) {
-      if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
-      if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>' + escHtml(data.error) + '</span></div>';
-    }
-    return;
-  }
-
-  if (data.status === 'paid' && data.result) {
-    stopPolling();
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.error) throw new Error(data.error);
+    // Now generate the results
     if (activeService === 'resume_ai') {
       generateAIResume();
     } else {
-      renderStep3(data.result);
+      generateResult();
     }
-    return;
-  }
-
-  if (!silent) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Check payment status now →'; }
-    var msg = data.message || 'Payment not yet detected.';
-    if (statusEl) statusEl.innerHTML = '<div class="warn-box"><span>⏳</span><span>' + escHtml(msg) + '</span></div>';
-  }
-  if (waitEl && data.processor_status) {
-    waitEl.innerHTML = '<span>⏳</span><span>Status: ' + escHtml(data.processor_status) + '. Checking automatically every 10 seconds…</span>';
-  }
+  })
+  .catch(function(err) {
+    if (btn) { btn.disabled = false; btn.textContent = 'I\'ve completed payment →'; }
+    alert('Error: ' + err.message);
+  });
 }
 
-// ─────────────────────────────────────────────
-// AI RESUME GENERATION
-// ─────────────────────────────────────────────
 function generateAIResume() {
-  var btn = document.getElementById('verify-btn');
+  var btn = document.querySelector('.btn-full');
   if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Generating your resume…'; }
 
   fetch('/api/generate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(Object.assign({order_id: currentOrder ? currentOrder.order_id : null}, formPayload))
+    body: JSON.stringify(formPayload)
   })
   .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
   .then(function(res) {
@@ -1763,9 +1416,28 @@ function generateAIResume() {
     renderStep3({ai_result: res.data});
   })
   .catch(function(err) {
-    var statusEl = document.getElementById('verify-status');
-    if (btn) { btn.disabled = false; btn.textContent = 'Retry generation →'; btn.onclick = generateAIResume; }
-    if (statusEl) statusEl.innerHTML = '<div class="err-box"><span>⚠</span><span>Generation failed: ' + escHtml(err.message) + '. Please try again.</span></div>';
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateAIResume; }
+    alert('Generation failed: ' + err.message);
+  });
+}
+
+function generateResult() {
+  var btn = document.querySelector('.btn-full');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Generating results…'; }
+
+  fetch('/api/generate-result', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({service: activeService, payload: formPayload})
+  })
+  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
+  .then(function(res) {
+    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
+    renderStep3(res.data);
+  })
+  .catch(function(err) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateResult; }
+    alert('Generation failed: ' + err.message);
   });
 }
 
@@ -1807,7 +1479,7 @@ function renderStep3(result) {
   var content = '';
 
   if (activeService === 'resume_ai') {
-    content = result && result.ai_result ? renderAIResult(result.ai_result) : '<div class="err-box"><span>⚠</span><span>Could not load AI result. Please contact support.</span></div>';
+    content = result && result.ai_result ? renderAIResult(result.ai_result) : '<div class="err-box"><span>⚠</span><span>Could not load AI result.</span></div>';
   } else if (activeService === 'resume_optimizer') {
     content = renderResumeResult(result);
   } else if (activeService === 'interview') {
@@ -1820,8 +1492,7 @@ function renderStep3(result) {
     '<div class="steps">' + stepsHtml(2) + '</div>' +
     '<div class="success-icon">✓</div>' +
     '<div style="text-align:center;margin-bottom:24px">' +
-      '<div style="font-family:var(--display);font-size:18px;font-weight:700;margin-bottom:4px">Payment confirmed</div>' +
-      '<div style="font-size:13px;color:var(--muted)">Here are your results</div>' +
+      '<div style="font-family:var(--display);font-size:18px;font-weight:700;margin-bottom:4px">Your Results Are Ready</div>' +
     '</div>' +
     '<div class="divider"></div>' +
     content +
@@ -1955,11 +1626,6 @@ function renderSalaryResult(r) {
 def api_services():
     return jsonify(SERVICES)
 
-@app.get("/api/prices")
-def api_prices():
-    return jsonify(CRYPTO_PRICES_USD)
-
-# Email capture endpoint — paste-text path (no file). Persists to SQLite.
 @app.post("/api/email-capture")
 def email_capture():
     body   = request.get_json(silent=True) or {}
@@ -1981,7 +1647,6 @@ def email_capture():
         source="capture_band_paste",
     )
 
-    # In production: send a transactional email with the score via SendGrid / Mailgun / Postmark.
     return jsonify({
         "ok":               True,
         "ats_score":        result.get("ats_score", 0),
@@ -1990,7 +1655,6 @@ def email_capture():
         "message":          "Score sent to " + email,
     })
 
-# Email capture endpoint — file upload path (PDF/DOCX/TXT). Persists to SQLite.
 @app.post("/api/upload-resume")
 def upload_resume():
     email = (request.form.get("email") or "").strip().lower()
@@ -2027,7 +1691,6 @@ def upload_resume():
         "message":          "Score sent to " + email,
     })
 
-# Admin endpoint — protect with ADMIN_SECRET env var in production
 @app.get("/api/emails")
 def list_emails():
     admin_secret = os.environ.get("ADMIN_SECRET", "")
@@ -2036,229 +1699,81 @@ def list_emails():
         return jsonify({"error": "Unauthorized"}), 401
     return jsonify({"count": count_emails(), "emails": list_all_emails()})
 
-def compute_result_for_service(service, payload):
-    """
-    Runs the appropriate deterministic tool for a paid order. resume_ai is
-    handled separately (see /api/generate) because it needs a live AI call
-    that's gated on the order actually being paid.
-    """
-    if service == "resume_optimizer":
-        return run_resume_optimizer(
-            payload.get("resume_text", ""),
-            payload.get("job_title", "Professional"),
-            payload.get("industry", "tech"),
-        )
-    elif service == "resume_ai":
-        return {"requires_ai_generation": True}
-    elif service == "interview":
-        return run_interview_prep(
-            payload.get("job_title", "Professional"),
-            payload.get("experience", "mid"),
-            payload.get("company", "the company"),
-        )
-    elif service == "salary":
-        return run_salary_negotiation(
-            int(payload.get("current_salary") or 80000),
-            int(payload.get("years") or 3),
-            payload.get("location", "remote"),
-            payload.get("job_title", "Professional"),
-        )
-    return {}
-
-def settle_order_paid(order_row, tx_hash=None):
-    """Idempotently mark an order paid and compute its result, if not already done."""
-    if order_row["status"] == "paid" and order_row.get("result_json"):
-        return json.loads(order_row["result_json"])
-    payload = json.loads(order_row["payload_json"] or "{}")
-    try:
-        result = compute_result_for_service(order_row["service"], payload)
-    except Exception as exc:
-        result = {"error": str(exc)}
-    db_mark_order_paid(order_row["id"], result, tx_hash=tx_hash)
-    return result
-
 @app.post("/api/orders")
 def create_order():
-    if not payments_configured():
-        return jsonify({
-            "error": "Crypto payments are not configured on this server. "
-                     "Set NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL to accept real payments."
-        }), 503
-
-    body    = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {}
     service = (body.get("service") or "").strip()
-    coin    = (body.get("coin") or "").strip()
+    button_id = (body.get("button_id") or "").strip()
+    payload = body.get("payload") or {}
 
     if service not in SERVICES:
         return jsonify({"error": f"Unknown service. Valid: {', '.join(SERVICES.keys())}"}), 400
-    if coin not in COIN_TO_NOWPAYMENTS_CURRENCY:
-        return jsonify({"error": "Unsupported coin. Valid: bitcoin, ethereum, usdt, solana"}), 400
 
-    usd      = SERVICES[service]["price_usd"]
     order_id = secrets.token_urlsafe(12)
+    db_create_order(order_id, service, button_id, payload)
+    
+    return jsonify({"order_id": order_id, "ok": True})
 
-    try:
-        payment = create_nowpayments_payment(order_id, usd, coin)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    payment_id   = payment.get("payment_id")
-    pay_address  = payment.get("pay_address")
-    pay_amount   = payment.get("pay_amount")
-    pay_currency = payment.get("pay_currency")
-
-    if not payment_id or not pay_address or pay_amount is None:
-        return jsonify({"error": "Payment processor returned an incomplete response"}), 502
-
-    db_create_order(order_id, service, coin, usd, payment_id, pay_address, pay_amount,
-                     pay_currency, body.get("payload") or {})
-
-    try:
-        qr_data = generate_qr(pay_address, coin, pay_amount)
-    except Exception:
-        qr_data = ""
-
-    return jsonify({
-        "order_id":     order_id,
-        "address":      pay_address,
-        "coin":         coin,
-        "pay_currency": pay_currency,
-        "amount":       pay_amount,
-        "usd":          usd,
-        "qr":           qr_data,
-    })
-
-@app.post("/api/orders/<order_id>/verify")
-def verify_order(order_id):
-    """
-    Fallback/manual verification: polls NOWPayments' status API. In normal
-    operation, the webhook below (/api/webhook/nowpayments) already marks
-    the order paid in real time, so this usually just confirms what the
-    webhook already recorded.
-    """
-    order_row = db_get_order(order_id)
-    if not order_row:
-        return jsonify({"error": "Order not found"}), 404
-
-    if order_row["status"] == "paid":
-        result = settle_order_paid(order_row)
-        return jsonify({"status": "paid", "result": result})
-
-    if not payments_configured():
-        return jsonify({"error": "Crypto payments are not configured on this server."}), 503
-
-    try:
-        status_resp = get_nowpayments_status(order_row["payment_id"])
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    processor_status = status_resp.get("payment_status", "waiting")
-    tx_hash = status_resp.get("payin_hash")
-
-    if processor_status in PAID_STATUSES:
-        order_row = db_get_order(order_id)  # re-fetch in case the webhook just landed
-        result = settle_order_paid(order_row, tx_hash=tx_hash)
-        return jsonify({"status": "paid", "result": result, "processor_status": processor_status})
-
-    if processor_status in DEAD_STATUSES:
-        db_update_order_status(order_id, processor_status)
-        return jsonify({
-            "status": "failed",
-            "processor_status": processor_status,
-            "message": f"This payment {processor_status} and cannot be completed. Please start a new order.",
-        })
-
-    db_update_order_status(order_id, processor_status)
-    return jsonify({
-        "status": "waiting",
-        "processor_status": processor_status,
-        "message": "Payment not yet detected. Crypto confirmations can take several minutes depending on network congestion.",
-    })
-
-@app.post("/api/webhook/nowpayments")
-def nowpayments_webhook():
-    """
-    Real-time payment confirmation. NOWPayments calls this URL whenever a
-    payment's status changes. The HMAC-SHA512 signature is verified before
-    trusting anything in the body — this is the actual proof-of-payment
-    check that replaces the old `random.random() > 0.10` stub.
-    """
-    signature = request.headers.get("x-nowpayments-sig", "")
+@app.post("/api/generate-result")
+def generate_result():
     body = request.get_json(silent=True) or {}
+    service = (body.get("service") or "").strip()
+    payload = body.get("payload") or {}
 
-    if not verify_nowpayments_signature(body, signature):
-        return jsonify({"error": "Invalid signature"}), 401
+    if service not in SERVICES:
+        return jsonify({"error": "Invalid service"}), 400
 
-    order_id       = body.get("order_id")
-    payment_status = body.get("payment_status")
-    tx_hash        = body.get("payin_hash")
+    try:
+        if service == "resume_optimizer":
+            result = run_resume_optimizer(
+                payload.get("resume_text", ""),
+                payload.get("job_title", "Professional"),
+                payload.get("industry", "tech"),
+            )
+        elif service == "interview":
+            result = run_interview_prep(
+                payload.get("job_title", "Professional"),
+                payload.get("experience", "mid"),
+                payload.get("company", "the company"),
+            )
+        elif service == "salary":
+            result = run_salary_negotiation(
+                int(payload.get("current_salary") or 80000),
+                int(payload.get("years") or 3),
+                payload.get("location", "remote"),
+                payload.get("job_title", "Professional"),
+            )
+        else:
+            return jsonify({"error": "Unsupported service for direct generation"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    if not order_id:
-        return jsonify({"error": "Missing order_id"}), 400
-
-    order_row = db_get_order(order_id)
-    if not order_row:
-        return jsonify({"error": "Unknown order_id"}), 404
-
-    if payment_status in PAID_STATUSES:
-        settle_order_paid(order_row, tx_hash=tx_hash)
-    elif payment_status:
-        db_update_order_status(order_id, payment_status, tx_hash=tx_hash)
-
-    return jsonify({"ok": True})
-
-@app.get("/api/orders/<order_id>")
-def get_order(order_id):
-    order_row = db_get_order(order_id)
-    if not order_row:
-        return jsonify({"error": "Order not found"}), 404
-    safe = {k: v for k, v in order_row.items() if k not in ("payload_json", "result_json")}
-    return jsonify(safe)
+    return jsonify(result)
 
 @app.post("/api/generate")
 def generate():
-    """
-    Generates the AI resume + cover letter for the resume_ai service. This
-    REQUIRES a paid order_id. Previously this endpoint had no payment check
-    at all, so anyone could call it directly and receive a full AI-written
-    resume + cover letter for free, without ever creating or paying for an
-    order — that hole is closed here.
-    """
-    body     = request.get_json(silent=True) or {}
-    order_id = (body.get("order_id") or "").strip()
-    name     = (body.get("name")   or "").strip()
-    skills   = (body.get("skills") or "").strip()
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    skills = (body.get("skills") or "").strip()
     job_desc = (body.get("job_desc") or "").strip()
 
-    if not order_id:
-        return jsonify({"error": "order_id is required"}), 400
     if not name:   return jsonify({"error": "Name is required"}), 400
     if not skills: return jsonify({"error": "Skills are required"}), 400
 
-    order_row = db_get_order(order_id)
-    if not order_row:
-        return jsonify({"error": "Order not found"}), 404
-    if order_row["service"] != "resume_ai":
-        return jsonify({"error": "This order is not for the AI Resume Generator"}), 400
-    if order_row["status"] != "paid":
-        return jsonify({"error": "This order has not been paid yet"}), 402
-
     try:
         resume_text = call_claude(build_resume_prompt(name, skills, job_desc))
-        cover_text  = call_claude(build_cover_letter_prompt(name, skills, job_desc, resume_text))
-        session_id  = secrets.token_urlsafe(16)
-        _ai_results[session_id] = {"resume": resume_text, "cover_letter": cover_text, "name": name}
+        cover_text = call_claude(build_cover_letter_prompt(name, skills, job_desc, resume_text))
     except Exception as e:
         return jsonify({"error": f"AI generation failed: {str(e)}"}), 500
 
-    return jsonify({"resume": resume_text, "cover_letter": cover_text, "session_id": session_id})
+    return jsonify({"resume": resume_text, "cover_letter": cover_text})
 
 @app.post("/api/pdf")
 def create_pdf():
-    body       = request.get_json(silent=True) or {}
-    name       = (body.get("name")          or "Candidate").strip()
-    resume_text = (body.get("resume")       or "").strip()
-    cover_text  = (body.get("cover_letter") or "").strip()
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "Candidate").strip()
+    resume_text = (body.get("resume") or "").strip()
+    cover_text = (body.get("cover_letter") or "").strip()
 
     if not resume_text:
         return jsonify({"error": "Resume content is required"}), 400
@@ -2285,9 +1800,7 @@ def health():
     return jsonify({
         "status": "ok",
         "orders": count_orders(),
-        "ai_results": len(_ai_results),
         "emails": count_emails(),
-        "payments_configured": payments_configured(),
         "ai_generation_configured": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
     })
 
@@ -2364,10 +1877,6 @@ if __name__ == "__main__":
     print("─" * 60)
     print("  CareerForge Pro  ·  http://localhost:5000")
     print("─" * 60)
-    if payments_configured():
-        print("  Crypto payments: NOWPayments (LIVE)")
-    else:
-        print("  Crypto payments: NOT CONFIGURED — set NOWPAYMENTS_API_KEY + PUBLIC_BASE_URL")
     if os.environ.get("ANTHROPIC_API_KEY"):
         print("  AI resume generation: configured")
     else:
@@ -2376,10 +1885,8 @@ if __name__ == "__main__":
     for svc, info in SERVICES.items():
         print(f"    • {info['name']} (${info['price_usd']})")
     print("─" * 60)
-    print("  SEO pages: /ats-resume-checker  /ai-cover-letter-generator")
-    print("             /interview-questions-generator  /resume-score  /resume-keywords")
-    print("─" * 60)
-    print("  Free ATS score + email capture: paste text OR upload PDF/DOCX/TXT")
-    print("  Admin emails: GET /api/emails?secret=<ADMIN_SECRET>")
+    print("  Payment buttons (NOWPayments, no API key required):")
+    for svc, info in SERVICES.items():
+        print(f"    • {info['name']}: iid={info['button_id']}")
     print("─" * 60)
     app.run(debug=False, host="0.0.0.0", port=5000)
