@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://careerforge-pm1q.onrender.com/sitemap.xml

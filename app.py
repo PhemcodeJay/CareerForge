@@ -4,14 +4,25 @@ import re
 import json
 import uuid
 import sqlite3
+import logging
 from io import BytesIO
 from datetime import datetime, timezone
 from datetime import datetime as dt
 
+
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import qrcode
 import base64
+
+# Production-ready logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -23,14 +34,45 @@ from reportlab.lib.colors import HexColor
 import pdfplumber
 import docx as docx_lib
 
-app = Flask(__name__, static_folder="static", static_url_path="/static")
+import pathlib
+import tempfile
+
+# Use system temp directory for all file operations (more reliable on Windows)
+OUTPUTS_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_outputs_"))
+STATIC_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_static_"))
+DB_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_db_"))
+
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+
+app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 CORS(app, supports_credentials=True)
 
-OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "outputs")
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-os.makedirs(STATIC_DIR, exist_ok=True)
+# Rate limiting setup
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+# Production ready JSON sort keys for consistent responses
+app.json.sort_keys = True
+
+# Security headers middleware
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://nowpayments.io; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src https://fonts.gstatic.com;"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
+# Disable debug mode in production
+if os.environ.get("FLASK_ENV") == "production":
+    app.debug = False
 
 SERVICES = {
     "resume_ai":        {"name": "AI Resume Generator",  "price_usd": 49, "button_id": "5845718217"},
@@ -63,7 +105,6 @@ _ai_results = {}
 # ============================================================================
 # PERSISTENT STORAGE (SQLite)
 # ============================================================================
-DB_DIR  = os.environ.get("DB_DIR", os.path.dirname(__file__))
 DB_PATH = os.path.join(DB_DIR, "careerforge.db")
 
 def get_db():
@@ -338,8 +379,8 @@ def cover_letter_to_story(name, cl_text, styles):
 def build_pdf(name, resume_text, cover_letter_text):
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name.strip())
     filename = f"careerforge_{safe_name}_{uuid.uuid4().hex[:6]}.pdf"
-    filepath = os.path.join(OUTPUTS_DIR, filename)
-    doc = SimpleDocTemplate(filepath, pagesize=letter,
+    filepath = OUTPUTS_DIR / filename
+    doc = SimpleDocTemplate(str(filepath), pagesize=letter,
                             leftMargin=0.75*inch, rightMargin=0.75*inch,
                             topMargin=0.75*inch, bottomMargin=0.75*inch)
     styles = make_styles()
@@ -1620,9 +1661,28 @@ function renderSalaryResult(r) {
 </html>'''
 
 # ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "Rate limit exceeded. Please wait before trying again.",
+        "retry_after": getattr(e, 'description', '60')
+    }), 429
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": "Internal server error. Please try again later."}), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found."}), 404
+
+# ============================================================================
 # API ROUTES
 # ============================================================================
 @app.get("/api/services")
+@limiter.limit("30 per minute")
 def api_services():
     return jsonify(SERVICES)
 
@@ -1790,10 +1850,10 @@ def download_file(filename):
     safe = re.sub(r"[^a-zA-Z0-9_\-.]", "", filename)
     if not safe.endswith(".pdf"):
         return jsonify({"error": "Invalid filename"}), 400
-    filepath = os.path.join(OUTPUTS_DIR, safe)
-    if not os.path.exists(filepath):
+    filepath = OUTPUTS_DIR / safe
+    if not filepath.exists():
         return jsonify({"error": "File not found. Please regenerate."}), 404
-    return send_file(filepath, as_attachment=True, download_name=safe, mimetype="application/pdf")
+    return send_file(str(filepath), as_attachment=True, download_name=safe, mimetype="application/pdf")
 
 @app.get("/health")
 def health():
