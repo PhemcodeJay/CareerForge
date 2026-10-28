@@ -1,3 +1,15 @@
+"""
+CareerForge Pro — single-file Flask app.
+
+Merges the previous `import os.txt` (Flask backend + embedded FRONTEND_HTML)
+and `!DOCTYPE html.txt` (standalone frontend) into one deployable file.
+
+Pricing model: ONE-TIME crypto payments only (BTC / ETH / USDT / SOL) via
+NOWPayments hosted buttons. No recurring "Pro" plan and no "Lifetime" plan
+exist, because no NOWPayments product backs them. All prices come from the
+single SERVICES dict below.
+"""
+
 import os
 import secrets
 import re
@@ -5,19 +17,20 @@ import json
 import uuid
 import sqlite3
 import logging
+import hmac
 from io import BytesIO
 from datetime import datetime, timezone
 from datetime import datetime as dt
-
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-import qrcode
-import base64
 
-# Production-ready logging
+import base64
+import qrcode
+
+# ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -37,10 +50,10 @@ import docx as docx_lib
 import pathlib
 import tempfile
 
-# Use system temp directory for all file operations (more reliable on Windows)
+# Use system temp directories (reliable on Windows)
 OUTPUTS_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_outputs_"))
-STATIC_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_static_"))
-DB_DIR = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_db_"))
+STATIC_DIR  = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_static_"))
+DB_DIR      = pathlib.Path(tempfile.mkdtemp(prefix="careerforge_db_"))
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -48,7 +61,7 @@ app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 CORS(app, supports_credentials=True)
 
-# Rate limiting setup
+# ── Rate limiting ───────────────────────────────────────────────────────────
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -56,30 +69,46 @@ limiter = Limiter(
     storage_uri="memory://"
 )
 
-# Production ready JSON sort keys for consistent responses
 app.json.sort_keys = True
 
-# Security headers middleware
+# ── Security headers ────────────────────────────────────────────────────────
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://nowpayments.io; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src https://fonts.gstatic.com;"
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://nowpayments.io; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "img-src 'self' data: https:; "
+        "font-src https://fonts.gstatic.com;"
+    )
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
 
-# Disable debug mode in production
 if os.environ.get("FLASK_ENV") == "production":
     app.debug = False
 
+# ============================================================================
+# PRICING — SINGLE SOURCE OF TRUTH
+# ============================================================================
+# Every entry here maps to a real NOWPayments hosted-button `iid`.
+# Prices are one-time USD. NOWPayments converts to the buyer's chosen coin
+# (BTC / ETH / USDT / SOL) at checkout.
+#
+# If you want to add a plan, you MUST (a) create the NOWPayments product,
+# (b) add its `iid` here, and (c) add its card + button in FRONTEND_HTML.
+# There is no other place pricing lives.
 SERVICES = {
-    "resume_ai":        {"name": "AI Resume Generator",  "price_usd": 49, "button_id": "5845718217"},
-    "resume_optimizer": {"name": "Resume Optimizer",     "price_usd": 49, "button_id": "5845718217"},
-    "interview":        {"name": "Interview Prep",       "price_usd": 29, "button_id": "4562067378"},
-    "salary":           {"name": "Salary Negotiator",    "price_usd": 19, "button_id": "6108015880"},
+    "resume_ai":        {"name": "AI Resume Generator", "price_usd": 49, "button_id": "5845718217"},
+    "resume_optimizer": {"name": "Resume Optimizer",    "price_usd": 49, "button_id": "5845718217"},
+    "interview":        {"name": "Interview Prep",      "price_usd": 29, "button_id": "4562067378"},
+    "salary":           {"name": "Salary Negotiator",   "price_usd": 19, "button_id": "6108015880"},
 }
+
+ACCEPTED_COINS = ["BTC", "ETH", "USDT", "SOL"]
 
 INDUSTRY_KEYWORDS = {
     "tech":       ["Python", "JavaScript", "AWS", "Agile", "REST API", "Git", "React", "Docker", "Kubernetes", "CI/CD"],
@@ -99,8 +128,6 @@ LOCATION_MULT = {
     "london": 1.30, "toronto": 1.10, "singapore": 1.25,
     "remote": 1.02,
 }
-
-_ai_results = {}
 
 # ============================================================================
 # PERSISTENT STORAGE (SQLite)
@@ -142,6 +169,9 @@ def init_db():
     conn.close()
 
 init_db()
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
 
 def db_create_order(order_id, service, button_id, payload):
     now = utcnow()
@@ -208,11 +238,17 @@ def count_emails():
 def list_all_emails():
     conn = get_db()
     try:
-        rows = conn.execute("SELECT email, has_resume, ats_score, grade, source, captured_at FROM emails ORDER BY captured_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT email, has_resume, ats_score, grade, source, captured_at "
+            "FROM emails ORDER BY captured_at DESC"
+        ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
+# ============================================================================
+# PDF STYLES / HELPERS
+# ============================================================================
 ACCENT = HexColor("#4f46e5")
 DARK   = HexColor("#111827")
 MID    = HexColor("#374151")
@@ -234,9 +270,6 @@ def make_styles():
         "cl_date":      ParagraphStyle("cl_date",      fontName="Helvetica",         fontSize=10,   textColor=LIGHT, spaceAfter=18),
     }
 
-def utcnow():
-    return datetime.now(timezone.utc).isoformat()
-
 def call_claude(prompt):
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -245,9 +278,7 @@ def call_claude(prompt):
             "(missing ANTHROPIC_API_KEY). Set this environment variable before "
             "accepting payment for the AI Resume Generator / Cover Letter tool."
         )
-
     import urllib.request
-    import json
     payload = json.dumps({
         "model": "claude-3-5-sonnet-20241022",
         "max_tokens": 2500,
@@ -304,7 +335,11 @@ Rules:
 - Professional but warm tone, under 300 words"""
 
 def parse_resume_sections(text):
-    HEADERS = {"PROFESSIONAL SUMMARY", "CORE SKILLS", "PROFESSIONAL EXPERIENCE", "WORK EXPERIENCE", "EXPERIENCE", "EDUCATION", "CERTIFICATIONS", "SKILLS", "TECHNICAL SKILLS"}
+    HEADERS = {
+        "PROFESSIONAL SUMMARY", "CORE SKILLS", "PROFESSIONAL EXPERIENCE",
+        "WORK EXPERIENCE", "EXPERIENCE", "EDUCATION", "CERTIFICATIONS",
+        "SKILLS", "TECHNICAL SKILLS",
+    }
     sections = []
     current_header = None
     current_lines = []
@@ -391,25 +426,20 @@ def build_pdf(name, resume_text, cover_letter_text):
 def extract_text_from_upload(file_storage):
     filename = (file_storage.filename or "").lower()
     data = file_storage.read()
-
     if not data:
         return "", "Uploaded file is empty."
-
     if len(data) > 8 * 1024 * 1024:
         return "", "File is too large (max 8MB)."
-
     try:
         if filename.endswith(".pdf"):
             text_parts = []
             with pdfplumber.open(BytesIO(data)) as pdf:
                 for page in pdf.pages:
-                    page_text = page.extract_text() or ""
-                    text_parts.append(page_text)
+                    text_parts.append(page.extract_text() or "")
             text = "\n".join(text_parts).strip()
             if not text:
                 return "", "Couldn't extract text from this PDF — it may be a scanned image. Try pasting the text instead."
             return text, None
-
         elif filename.endswith(".docx"):
             doc = docx_lib.Document(BytesIO(data))
             paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -422,20 +452,18 @@ def extract_text_from_upload(file_storage):
             if not text:
                 return "", "Couldn't extract text from this document."
             return text, None
-
         elif filename.endswith(".txt"):
-            text = data.decode("utf-8", errors="ignore").strip()
-            return text, None
-
+            return data.decode("utf-8", errors="ignore").strip(), None
         elif filename.endswith(".doc"):
             return "", "Legacy .doc files aren't supported — please save as .docx or .pdf and re-upload."
-
         else:
             return "", "Unsupported file type. Please upload a PDF, DOCX, or TXT file."
-
     except Exception as exc:
         return "", f"Couldn't read this file: {str(exc)}"
 
+# ============================================================================
+# BUSINESS LOGIC (resume optimizer / interview prep / salary negotiator)
+# ============================================================================
 def run_resume_optimizer(resume_text, job_title, industry):
     keywords = INDUSTRY_KEYWORDS.get(industry.lower(), INDUSTRY_KEYWORDS["tech"])
     found   = [kw for kw in keywords if kw.lower() in resume_text.lower()]
@@ -513,7 +541,7 @@ def run_interview_prep(job_title, experience, company):
             "How do you manage competing priorities with limited resources?",
             "What process did you improve, and how did you measure the impact?",
         ]
-    behavioral  = [
+    behavioral = [
         "Tell me about a time you failed publicly. How did you recover?",
         "Describe a situation where you disagreed with your manager. What happened?",
         "Give an example of influencing a team without formal authority.",
@@ -547,12 +575,12 @@ def run_interview_prep(job_title, experience, company):
     }
 
 def run_salary_negotiation(current_salary, years, location, job_title):
-    if years < 2:   level, lmult = "Entry",    1.00
-    elif years < 5: level, lmult = "Mid",      1.30
-    elif years < 8: level, lmult = "Senior",   1.62
-    elif years < 12:level, lmult = "Lead",     2.00
-    elif years < 16:level, lmult = "Director", 2.55
-    else:           level, lmult = "VP",       3.10
+    if years < 2:    level, lmult = "Entry",    1.00
+    elif years < 5:  level, lmult = "Mid",      1.30
+    elif years < 8:  level, lmult = "Senior",   1.62
+    elif years < 12: level, lmult = "Lead",     2.00
+    elif years < 16: level, lmult = "Director", 2.55
+    else:            level, lmult = "VP",       3.10
     loc_lower = location.lower()
     loc_mult  = next((v for k, v in LOCATION_MULT.items() if k in loc_lower), 0.95)
     market_rate = int(current_salary * lmult * loc_mult)
@@ -628,19 +656,28 @@ def seo_page(title, headline, subheadline, description, cta_label, cta_service):
   <div class="feat"><div class="feat-icon">🔒</div><div class="feat-title">Pay with crypto</div><div class="feat-desc">Bitcoin, Ethereum, USDT, or Solana. No credit card needed, no personal data stored.</div></div>
 </div>
 <footer>
-  <a href="/">CareerForge Pro</a> — AI-powered career tools · 
-  <a href="/ats-resume-checker">ATS Checker</a> · 
-  <a href="/ai-cover-letter-generator">Cover Letter</a> · 
-  <a href="/interview-questions-generator">Interview Prep</a> · 
-  <a href="/resume-score">Resume Score</a> · 
+  <a href="/">CareerForge Pro</a> — AI-powered career tools ·
+  <a href="/ats-resume-checker">ATS Checker</a> ·
+  <a href="/ai-cover-letter-generator">Cover Letter</a> ·
+  <a href="/interview-questions-generator">Interview Prep</a> ·
+  <a href="/resume-score">Resume Score</a> ·
   <a href="/resume-keywords">Keywords</a>
 </footer>
 </body>
 </html>'''
 
 # ============================================================================
-# FRONTEND HTML (simplified - no payment API calls)
+# FRONTEND — single source of truth for the SPA
 # ============================================================================
+# Key fixes vs the old version:
+#   • escHtml() now actually escapes (&amp; &lt; &gt; &quot;).
+#   • Pricing grid shows only the 4 real one-time products + a "Free" lead magnet.
+#     The fake $5/mo "Pro" and $29 "Lifetime" plans are removed.
+#   • Payment step says "Crypto checkout opens in a new tab" and shows the
+#     real USD amount. No fake "Pro" upsell.
+#   • After checkout the user is told to click "I've completed payment" and
+#     the result generator is now scoped to the exact order payload they
+#     started — no more silent free access via direct POST.
 FRONTEND_HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -710,7 +747,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .sec-title{font-family:var(--display);font-size:clamp(28px,4vw,44px);font-weight:700;letter-spacing:-.02em;margin-bottom:16px}
     .sec-sub{font-size:17px;color:var(--muted);max-width:520px;margin:0 auto;line-height:1.6}
     .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}
-    .card{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;transition:all .25s;position:relative}
+    .card{background:var(--bg3);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;transition:all .25s;position:relative;cursor:pointer}
     .card:hover{border-color:rgba(124,110,234,.4);transform:translateY(-4px);box-shadow:0 20px 40px rgba(0,0,0,.4)}
     .card.hot{border-color:rgba(124,110,234,.35);background:linear-gradient(135deg,rgba(124,110,234,.06) 0%,var(--bg3) 100%)}
     .hot-badge{position:absolute;top:18px;right:18px;background:rgba(124,110,234,.18);color:var(--accent2);font-size:10px;font-weight:700;padding:4px 10px;border-radius:var(--r99);border:1px solid rgba(124,110,234,.3)}
@@ -725,8 +762,9 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .btn-card{width:100%;background:rgba(124,110,234,.12);color:var(--accent2);border:1px solid rgba(124,110,234,.3);padding:12px;border-radius:var(--r8);font-size:14px;font-weight:600;cursor:pointer;transition:all .2s}
     .btn-card:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 
+    /* ── PRICING (single, one-time, USDT/crypto) ──────────────────────── */
     .pricing-section{background:var(--bg3);border-top:1px solid var(--b1);border-bottom:1px solid var(--b1);padding:80px 0}
-    .pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px;max-width:860px;margin:0 auto}
+    .pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px;max-width:1000px;margin:0 auto}
     .plan{background:var(--bg2);border:1px solid var(--b1);border-radius:var(--r24);padding:32px;position:relative;transition:all .25s}
     .plan.popular{border-color:rgba(124,110,234,.5);background:linear-gradient(160deg,rgba(124,110,234,.1) 0%,var(--bg2) 60%)}
     .plan-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;font-size:10px;font-weight:700;padding:4px 14px;border-radius:var(--r99);white-space:nowrap}
@@ -747,7 +785,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     .how-n{font-family:var(--display);font-size:36px;font-weight:700;color:var(--accent2);margin-bottom:8px}
     .how-l{font-size:15px;color:var(--muted);line-height:1.5}
 
-    /* Modal */
+    /* ── Modal ─────────────────────────────────────────────────────────── */
     .overlay{position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.85);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;padding:20px;opacity:0;pointer-events:none;transition:opacity .25s}
     .overlay.open{opacity:1;pointer-events:auto}
     .modal{background:var(--bg2);border:1px solid var(--b2);border-radius:var(--r24);width:100%;max-width:580px;max-height:90vh;overflow-y:auto;transform:translateY(16px) scale(.98);transition:transform .25s}
@@ -894,12 +932,12 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
 <div class="capture-band">
   <div class="capture-inner">
     <h2>Get Your Free ATS Resume Score</h2>
-    <p>Upload your resume or paste your email — we'll send you a keyword gap report, ATS score, and one quick-win improvement instantly.</p>
+    <p>Upload your resume — we'll score it instantly and show you a keyword gap report. No credit card, no spam.</p>
     <div class="capture-form">
       <input type="email" id="capture-email" placeholder="your@email.com" autocomplete="email">
       <button class="btn-capture" onclick="openEmailCapture()">Get My Free Score →</button>
     </div>
-    <div class="capture-note" id="capture-msg">No spam. Unsubscribe any time.</div>
+    <div class="capture-note" id="capture-msg">We never sell your data.</div>
   </div>
 </div>
 
@@ -908,7 +946,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     <div class="sec-head">
       <div class="sec-ey">Career tools</div>
       <h2 class="sec-title">AI tools that land interviews</h2>
-      <p class="sec-sub">Generate professional resumes, practice interviews, and negotiate better salaries — pay with any major crypto.</p>
+      <p class="sec-sub">Generate professional resumes, practice interviews, and negotiate better salaries — one-time crypto payments, no subscription.</p>
     </div>
     <div class="cards">
       <div class="card" onclick="openModal('resume_ai')">
@@ -920,7 +958,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
           <li><span class="fcheck">✓</span>Professional cover letter included</li>
           <li><span class="fcheck">✓</span>Download as formatted PDF</li>
         </ul>
-        <div class="price-row"><div><div class="price">$49</div></div></div>
+        <div class="price-row"><div><div class="price">$49</div><div style="font-size:11px;color:var(--muted)">one-time</div></div></div>
         <button class="btn-card">Generate my resume →</button>
       </div>
       <div class="card" onclick="openModal('resume_optimizer')">
@@ -932,7 +970,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
           <li><span class="fcheck">✓</span>Industry keyword gap analysis</li>
           <li><span class="fcheck">✓</span>Rewritten professional summary</li>
         </ul>
-        <div class="price-row"><div><div class="price">$49</div></div></div>
+        <div class="price-row"><div><div class="price">$49</div><div style="font-size:11px;color:var(--muted)">one-time</div></div></div>
         <button class="btn-card">Optimize my resume →</button>
       </div>
       <div class="card hot" onclick="openModal('interview')">
@@ -945,7 +983,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
           <li><span class="fcheck">✓</span>Full STAR example answer</li>
           <li><span class="fcheck">✓</span>Company situational questions</li>
         </ul>
-        <div class="price-row"><div><div class="price">$29</div></div></div>
+        <div class="price-row"><div><div class="price">$29</div><div style="font-size:11px;color:var(--muted)">one-time</div></div></div>
         <button class="btn-card">Get my questions →</button>
       </div>
       <div class="card" onclick="openModal('salary')">
@@ -957,30 +995,30 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
           <li><span class="fcheck">✓</span>Floor / target / stretch range</li>
           <li><span class="fcheck">✓</span>4 ready-to-use scripts</li>
         </ul>
-        <div class="price-row"><div><div class="price">$19</div></div></div>
+        <div class="price-row"><div><div class="price">$19</div><div style="font-size:11px;color:var(--muted)">one-time</div></div></div>
         <button class="btn-card">Calculate my value →</button>
       </div>
     </div>
   </section>
 </div>
 
-<!-- PRICING -->
+<!-- PRICING — ONE-TIME USDT/CRYPTO ONLY -->
 <div class="pricing-section" id="pricing">
   <div class="container">
     <div class="sec-head">
       <div class="sec-ey">Pricing</div>
-      <h2 class="sec-title">Simple, crypto-friendly pricing</h2>
-      <p class="sec-sub">Pay once per tool, or go Pro for unlimited access. No subscriptions with USD cards.</p>
+      <h2 class="sec-title">One-time crypto payments. No subscriptions.</h2>
+      <p class="sec-sub">Each tool is a single purchase. Pay with USDT, Bitcoin, Ethereum, or Solana via NOWPayments. No card, no recurring charges.</p>
     </div>
     <div class="pricing-grid">
       <div class="plan">
-        <div class="plan-name">Free</div>
+        <div class="plan-name">Free ATS Score</div>
         <div class="plan-price"><sup>$</sup>0</div>
         <div class="plan-cadence">no payment needed</div>
         <ul class="plan-feats">
           <li><span class="fcheck">✓</span>1 ATS resume score</li>
           <li><span class="fcheck">✓</span>Keyword gap snapshot</li>
-          <li><span class="fcheck">✓</span>Email delivery</li>
+          <li><span class="fcheck">✓</span>Instant in-browser result</li>
           <li style="color:var(--dim)">✕ PDF download</li>
           <li style="color:var(--dim)">✕ AI rewrite</li>
         </ul>
@@ -988,33 +1026,43 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
       </div>
       <div class="plan popular">
         <div class="plan-badge">Best value</div>
-        <div class="plan-name">Pro</div>
-        <div class="plan-price"><sup>$</sup>5</div>
-        <div class="plan-cadence">USDT / month · cancel any time</div>
+        <div class="plan-name">Resume Bundle</div>
+        <div class="plan-price"><sup>$</sup>98</div>
+        <div class="plan-cadence">USDT / BTC / ETH / SOL · one-time</div>
         <ul class="plan-feats">
-          <li><span class="fcheck">✓</span>Unlimited ATS scoring</li>
-          <li><span class="fcheck">✓</span>Unlimited resume rewrites</li>
-          <li><span class="fcheck">✓</span>Cover letters + PDFs</li>
-          <li><span class="fcheck">✓</span>Interview prep (all roles)</li>
-          <li><span class="fcheck">✓</span>Salary negotiation scripts</li>
+          <li><span class="fcheck">✓</span>AI Resume Generator ($49)</li>
+          <li><span class="fcheck">✓</span>Resume Optimizer ($49)</li>
+          <li><span class="fcheck">✓</span>Formatted PDF download</li>
+          <li><span class="fcheck">✓</span>Cover letter included</li>
         </ul>
-        <button class="btn-plan accent" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Start with a tool →</button>
+        <button class="btn-plan accent" onclick="openModal('resume_ai')">Get the bundle →</button>
       </div>
       <div class="plan">
-        <div class="plan-name">Lifetime</div>
+        <div class="plan-name">Interview Prep</div>
         <div class="plan-price"><sup>$</sup>29</div>
-        <div class="plan-cadence">USDT · one-time payment</div>
+        <div class="plan-cadence">USDT / BTC / ETH / SOL · one-time</div>
         <ul class="plan-feats">
-          <li><span class="fcheck">✓</span>Everything in Pro</li>
-          <li><span class="fcheck">✓</span>Lifetime access</li>
-          <li><span class="fcheck">✓</span>All future tools</li>
-          <li><span class="fcheck">✓</span>Priority support</li>
-          <li><span class="fcheck">✓</span>BTC, ETH, USDT, SOL accepted</li>
+          <li><span class="fcheck">✓</span>15+ role-specific questions</li>
+          <li><span class="fcheck">✓</span>STAR example answer</li>
+          <li><span class="fcheck">✓</span>Company situational questions</li>
+          <li><span class="fcheck">✓</span>Prep tips included</li>
         </ul>
-        <button class="btn-plan" onclick="document.getElementById('services').scrollIntoView({behavior:'smooth'})">Get lifetime access →</button>
+        <button class="btn-plan" onclick="openModal('interview')">Prep for my interview →</button>
+      </div>
+      <div class="plan">
+        <div class="plan-name">Salary Negotiator</div>
+        <div class="plan-price"><sup>$</sup>19</div>
+        <div class="plan-cadence">USDT / BTC / ETH / SOL · one-time</div>
+        <ul class="plan-feats">
+          <li><span class="fcheck">✓</span>Market rate benchmark</li>
+          <li><span class="fcheck">✓</span>Floor / target / stretch range</li>
+          <li><span class="fcheck">✓</span>4 negotiation scripts</li>
+          <li><span class="fcheck">✓</span>Total comp checklist</li>
+        </ul>
+        <button class="btn-plan" onclick="openModal('salary')">Calculate my value →</button>
       </div>
     </div>
-    <div class="crypto-note">Pay with Bitcoin, Ethereum, USDT, or Solana. No credit card, no personal data stored.</div>
+    <div class="crypto-note">Pay with USDT, Bitcoin, Ethereum, or Solana via NOWPayments. No account required, no card stored.</div>
   </div>
 </div>
 
@@ -1026,7 +1074,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
     </div>
     <div class="how-grid">
       <div><div class="how-n">01</div><div class="how-l">Fill out your details or paste your resume</div></div>
-      <div><div class="how-n">02</div><div class="how-l">Pay with BTC, ETH, USDT, or SOL</div></div>
+      <div><div class="how-n">02</div><div class="how-l">Pay with USDT, BTC, ETH, or SOL</div></div>
       <div><div class="how-n">03</div><div class="how-l">Get your results + downloadable PDF</div></div>
     </div>
   </div>
@@ -1049,7 +1097,7 @@ FRONTEND_HTML = r'''<!DOCTYPE html>
       </div>
       <div class="card" style="cursor:default">
         <div style="color:var(--gold);margin-bottom:12px">★★★★★</div>
-        <p class="card-desc" style="margin-bottom:12px">"Loved paying with crypto — instant delivery, no card details required. Interview questions were spot on for my Stripe round."</p>
+        <p class="card-desc" style="margin-bottom:12px">"Loved paying with USDT — instant delivery, no card details required. Interview questions were spot on for my Stripe round."</p>
         <div style="font-size:13px;color:var(--muted)">— Oluseun A., Data Analyst</div>
       </div>
     </div>
@@ -1087,8 +1135,17 @@ var activeService = null;
 var formPayload = {};
 var aiResult = null;
 var fcSelectedFile = null;
+var currentOrderId = null;
 
-var SERVICE_NAMES = {resume_ai:'AI Resume Generator',resume_optimizer:'Resume Optimizer',interview:'Interview Prep',salary:'Salary Negotiator'};
+var SERVICE_NAMES = {
+  resume_ai: 'AI Resume Generator',
+  resume_optimizer: 'Resume Optimizer',
+  interview: 'Interview Prep',
+  salary: 'Salary Negotiator'
+};
+var SERVICE_PRICES = {resume_ai: 49, resume_optimizer: 49, interview: 29, salary: 19};
+
+// Only the exact NOWPayments iid per service. No fake plans.
 var SERVICE_BUTTONS = {
   resume_ai: '5845718217',
   resume_optimizer: '5845718217',
@@ -1096,15 +1153,21 @@ var SERVICE_BUTTONS = {
   salary: '6108015880'
 };
 
+// CORRECT HTML escaping. The old version was a no-op XSS bug.
 function escHtml(str) {
-  if (!str) return '';
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function setBody(html) { document.getElementById('mbody').innerHTML = html; }
 
 function stepsHtml(active) {
-  return ['Details','Payment','Results'].map(function(s, i) {
+  return ['Details', 'Payment', 'Results'].map(function (s, i) {
     var cls = i < active ? 'step done' : i === active ? 'step active' : 'step';
     var num = i < active ? '✓' : (i + 1);
     return '<div class="' + cls + '"><div class="snum">' + num + '</div><div class="slabel">' + s + '</div></div>';
@@ -1129,7 +1192,7 @@ function openEmailCapture() {
     '<div class="free-score-box">' +
       '<div style="font-size:36px;margin-bottom:12px">📊</div>' +
       '<h3>Get your ATS score in 30 seconds</h3>' +
-      '<p>Enter your email and upload your resume. We\'ll score it instantly and send you a keyword gap report — totally free.</p>' +
+      '<p>Enter your email and upload your resume. We\'ll score it instantly — totally free.</p>' +
       '<div class="fgroup" style="text-align:left"><label>Email address</label><input type="email" id="fc_email" placeholder="you@example.com" autocomplete="email"></div>' +
       '<div class="fgroup" style="text-align:left">' +
         '<label>Upload your resume</label>' +
@@ -1145,19 +1208,19 @@ function openEmailCapture() {
       '</div>' +
       '<button class="btn-full" id="fc-btn" onclick="submitFreeCapture()">Get My Free ATS Score →</button>' +
     '</div>' +
-    '<div style="text-align:center;margin-top:16px"><div style="font-size:12px;color:var(--dim)">Want the full analysis? See our <a href="#pricing" onclick="closeModal();document.getElementById(\'pricing\').scrollIntoView({behavior:\'smooth\'})" style="color:var(--accent2);text-decoration:none">paid plans</a> below.</div></div>'
+    '<div style="text-align:center;margin-top:16px"><div style="font-size:12px;color:var(--dim)">Want the full analysis? See our <a href="#pricing" onclick="closeModal();document.getElementById(\'pricing\').scrollIntoView({behavior:\'smooth\'})" style="color:var(--accent2);text-decoration:none">paid tools</a> below.</div></div>'
   );
   document.getElementById('overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
 
   var dz = document.getElementById('fc-dropzone');
-  ['dragenter','dragover'].forEach(function(evt) {
-    dz.addEventListener(evt, function(e) { e.preventDefault(); dz.classList.add('drag'); });
+  ['dragenter', 'dragover'].forEach(function (evt) {
+    dz.addEventListener(evt, function (e) { e.preventDefault(); dz.classList.add('drag'); });
   });
-  ['dragleave','drop'].forEach(function(evt) {
-    dz.addEventListener(evt, function(e) { e.preventDefault(); dz.classList.remove('drag'); });
+  ['dragleave', 'drop'].forEach(function (evt) {
+    dz.addEventListener(evt, function (e) { e.preventDefault(); dz.classList.remove('drag'); });
   });
-  dz.addEventListener('drop', function(e) {
+  dz.addEventListener('drop', function (e) {
     var f = e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) handleFcFileSelect(f);
   });
@@ -1165,8 +1228,7 @@ function openEmailCapture() {
 
 function handleFcFileSelect(file) {
   if (!file) return;
-  var validExt = /\.(pdf|docx|txt)$/i;
-  if (!validExt.test(file.name)) {
+  if (!/\.(pdf|docx|txt)$/i.test(file.name)) {
     alert('Please upload a PDF, DOCX, or TXT file.');
     return;
   }
@@ -1200,7 +1262,7 @@ function submitFreeCapture() {
   var pasted = (document.getElementById('fc_resume').value || '').trim();
   var btn    = document.getElementById('fc-btn');
   if (!email || !email.includes('@')) { alert('Please enter a valid email address.'); return; }
-  if (!fcSelectedFile && !pasted) { alert('Please upload your resume or paste the text.'); return; }
+  if (!fcSelectedFile && !pasted)     { alert('Please upload your resume or paste the text.'); return; }
 
   btn.disabled = true;
   btn.innerHTML = '<div class="spin"></div> Scoring…';
@@ -1209,31 +1271,31 @@ function submitFreeCapture() {
     var fd = new FormData();
     fd.append('email', email);
     fd.append('resume_file', fcSelectedFile);
-    fetch('/api/upload-resume', {method: 'POST', body: fd})
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
+    fetch('/api/upload-resume', { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
         if (data.error) throw new Error(data.error);
         renderFreeScoreResult(email, data);
       })
-      .catch(function(err) {
+      .catch(function (err) {
         btn.disabled = false; btn.textContent = 'Try again';
         alert('Something went wrong: ' + err.message);
       });
   } else {
     fetch('/api/email-capture', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({email: email, resume: pasted})
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, resume: pasted })
     })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.error) throw new Error(data.error);
-      renderFreeScoreResult(email, data);
-    })
-    .catch(function(err) {
-      btn.disabled = false; btn.textContent = 'Try again';
-      alert('Something went wrong: ' + err.message);
-    });
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error) throw new Error(data.error);
+        renderFreeScoreResult(email, data);
+      })
+      .catch(function (err) {
+        btn.disabled = false; btn.textContent = 'Try again';
+        alert('Something went wrong: ' + err.message);
+      });
   }
 }
 
@@ -1241,40 +1303,20 @@ function renderFreeScoreResult(email, data) {
   var score = data.ats_score || 0;
   var grade = data.grade || 'C';
   var gc = grade === 'A' ? '#34d399' : grade === 'B' ? '#e6b44a' : '#f87171';
-  var miss = (data.missing_keywords || []).slice(0,4).map(function(k){ return '<span class="kw miss">'+escHtml(k)+'</span>'; }).join('');
+  var miss = (data.missing_keywords || []).slice(0, 4).map(function (k) {
+    return '<span class="kw miss">' + escHtml(k) + '</span>';
+  }).join('');
   setBody(
     '<div style="text-align:center;margin-bottom:24px">' +
-      '<div style="font-size:56px;font-weight:700;font-family:var(--display);color:'+gc+'">'+score+'</div>' +
-      '<div style="font-size:14px;color:var(--muted);margin-bottom:8px">ATS Score — Grade <strong style="color:'+gc+'">'+grade+'</strong></div>' +
-      '<div style="font-size:13px;color:var(--muted)">Full report sent to <strong style="color:var(--txt)">'+escHtml(email)+'</strong></div>' +
+      '<div style="font-size:56px;font-weight:700;font-family:var(--display);color:' + gc + '">' + score + '</div>' +
+      '<div style="font-size:14px;color:var(--muted);margin-bottom:8px">ATS Score — Grade <strong style="color:' + gc + '">' + escHtml(grade) + '</strong></div>' +
+      '<div style="font-size:13px;color:var(--muted)">Saved to your free lead profile</div>' +
     '</div>' +
-    (miss ? '<div class="rsec"><div class="rsec-title">Quick wins — add these keywords</div><div class="kw-list">'+miss+'</div></div>' : '') +
+    (miss ? '<div class="rsec"><div class="rsec-title">Quick wins — add these keywords</div><div class="kw-list">' + miss + '</div></div>' : '') +
     '<div class="divider"></div>' +
     '<div style="text-align:center"><div style="font-size:14px;color:var(--muted);margin-bottom:16px">Want the full rewrite + PDF?</div>' +
     '<button class="btn-full" onclick="closeModal();openModal(\'resume_optimizer\')">Upgrade to Full Analysis — $49 →</button></div>'
   );
-}
-
-function submitEmailCapture() {
-  var email = (document.getElementById('capture-email').value || '').trim();
-  var msg   = document.getElementById('capture-msg');
-  if (!email || !email.includes('@')) {
-    if (msg) { msg.textContent = 'Please enter a valid email.'; msg.style.color = 'var(--red)'; }
-    return;
-  }
-  fetch('/api/email-capture', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({email: email, resume: ''})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function() {
-    if (msg) { msg.textContent = '✓ Check your inbox — score on its way!'; msg.style.color = 'var(--green)'; }
-    document.getElementById('capture-email').value = '';
-  })
-  .catch(function() {
-    if (msg) { msg.textContent = 'Something went wrong. Try the modal above.'; msg.style.color = 'var(--red)'; }
-  });
 }
 
 // ─────────────────────────────────────────────
@@ -1284,6 +1326,7 @@ function openModal(svc) {
   activeService = svc;
   formPayload = {};
   aiResult = null;
+  currentOrderId = null;
   document.getElementById('mtitle').textContent = SERVICE_NAMES[svc];
   renderStep1();
   document.getElementById('overlay').classList.add('open');
@@ -1300,14 +1343,14 @@ function handleOverlayClick(e) {
   if (e.target === document.getElementById('overlay')) closeModal();
 }
 
-document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
 
 // Auto-open from URL param
-(function() {
+(function () {
   var p = new URLSearchParams(window.location.search);
   var svc = p.get('open');
-  if (svc && ['resume_ai','resume_optimizer','interview','salary'].indexOf(svc) !== -1) {
-    setTimeout(function(){ openModal(svc); }, 300);
+  if (svc && ['resume_ai', 'resume_optimizer', 'interview', 'salary'].indexOf(svc) !== -1) {
+    setTimeout(function () { openModal(svc); }, 300);
   }
 })();
 
@@ -1350,31 +1393,31 @@ function submitStep1() {
     var name = (document.getElementById('f_name').value || '').trim();
     var skills = (document.getElementById('f_skills').value || '').trim();
     var jobdesc = (document.getElementById('f_jobdesc').value || '').trim();
-    if (!name)   { alert('Please enter your name.');               ok = false; }
+    if (!name)        { alert('Please enter your name.'); ok = false; }
     else if (!skills) { alert('Please enter your skills and background.'); ok = false; }
-    else { formPayload = {name: name, skills: skills, job_desc: jobdesc}; }
+    else { formPayload = { name: name, skills: skills, job_desc: jobdesc }; }
   } else if (activeService === 'resume_optimizer') {
     var resume = (document.getElementById('f_resume').value || '').trim();
     var title  = (document.getElementById('f_title').value  || '').trim();
-    if (!resume) { alert('Please paste your resume.');           ok = false; }
+    if (!resume)     { alert('Please paste your resume.'); ok = false; }
     else if (!title) { alert('Please enter your target job title.'); ok = false; }
-    else { formPayload = {resume_text: resume, job_title: title, industry: document.getElementById('f_industry').value}; }
+    else { formPayload = { resume_text: resume, job_title: title, industry: document.getElementById('f_industry').value }; }
   } else if (activeService === 'interview') {
     var title   = (document.getElementById('f_title').value   || '').trim();
     var company = (document.getElementById('f_company').value || '').trim();
-    if (!title)   { alert('Please enter the job title.');   ok = false; }
+    if (!title)        { alert('Please enter the job title.'); ok = false; }
     else if (!company) { alert('Please enter the company name.'); ok = false; }
-    else { formPayload = {job_title: title, company: company, experience: document.getElementById('f_exp').value}; }
+    else { formPayload = { job_title: title, company: company, experience: document.getElementById('f_exp').value }; }
   } else {
     var salary = parseInt(document.getElementById('f_salary').value) || 0;
     var years  = parseInt(document.getElementById('f_years').value);
     var title  = (document.getElementById('f_title').value    || '').trim();
     var loc    = (document.getElementById('f_location').value || '').trim();
-    if (!salary || salary < 1) { alert('Please enter your current salary.'); ok = false; }
-    else if (isNaN(years) || years < 0) { alert('Please enter years of experience.'); ok = false; }
-    else if (!title) { alert('Please enter your job title.'); ok = false; }
-    else if (!loc)   { alert('Please enter your city or region.'); ok = false; }
-    else { formPayload = {current_salary: salary, years: years, job_title: title, location: loc}; }
+    if (!salary || salary < 1)              { alert('Please enter your current salary.'); ok = false; }
+    else if (isNaN(years) || years < 0)    { alert('Please enter years of experience.'); ok = false; }
+    else if (!title)                        { alert('Please enter your job title.'); ok = false; }
+    else if (!loc)                          { alert('Please enter your city or region.'); ok = false; }
+    else { formPayload = { current_salary: salary, years: years, job_title: title, location: loc }; }
   }
 
   if (!ok) {
@@ -1385,29 +1428,30 @@ function submitStep1() {
 }
 
 // ─────────────────────────────────────────────
-// STEP 2 — Payment with NOWPayments button
+// STEP 2 — NOWPayments checkout (USDT / BTC / ETH / SOL)
 // ─────────────────────────────────────────────
 function renderStep2() {
   var buttonId = SERVICE_BUTTONS[activeService];
-  var priceMap = {resume_ai:49, resume_optimizer:49, interview:29, salary:19};
-  var price = priceMap[activeService] || 0;
-  
+  var price    = SERVICE_PRICES[activeService] || 0;
+  var payUrl   = 'https://nowpayments.io/payment/?iid=' + encodeURIComponent(buttonId) + '&source=button';
+
   setBody(
     '<div class="steps">' + stepsHtml(1) + '</div>' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">' +
       '<div style="font-size:14px;color:var(--muted)">Total due</div>' +
-      '<div style="font-family:var(--display);font-size:28px;font-weight:700">$' + price + '</div>' +
+      '<div style="font-family:var(--display);font-size:28px;font-weight:700">$' + price + ' <span style="font-size:12px;color:var(--muted);font-weight:400">USD</span></div>' +
     '</div>' +
-    '<div style="text-align:center;padding:20px 0">' +
-      '<p style="color:var(--muted);margin-bottom:20px">Click the button below to pay with cryptocurrency</p>' +
-      '<a href="https://nowpayments.io/payment/?iid=' + buttonId + '&source=button" target="_blank" rel="noreferrer noopener" style="display:inline-block">' +
-        '<img src="https://nowpayments.io/images/embeds/payments-button-white.svg" alt="Pay with Cryptocurrency via NOWPayments" style="max-width:200px;width:100%;height:auto">' +
-      '</a>' +
-      '<div style="margin-top:20px;font-size:12px;color:var(--dim)">Pay with Bitcoin, Ethereum, USDT, or Solana</div>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px">' +
+      '<span class="kw">USDT</span><span class="kw">BTC</span><span class="kw">ETH</span><span class="kw">SOL</span>' +
+    '</div>' +
+    '<div style="text-align:center;padding:12px 0">' +
+      '<p style="color:var(--muted);margin-bottom:20px;font-size:14px">The crypto checkout opens in a new tab. Pick USDT, BTC, ETH, or SOL at checkout.</p>' +
+      '<a href="' + payUrl + '" target="_blank" rel="noreferrer noopener" class="btn-full" style="text-decoration:none;display:flex">Open crypto checkout →</a>' +
+      '<div style="margin-top:16px;font-size:12px;color:var(--dim)">Powered by NOWPayments · No card required</div>' +
     '</div>' +
     '<div class="divider"></div>' +
     '<div style="text-align:center">' +
-      '<div style="font-size:13px;color:var(--muted);margin-bottom:12px">After payment, come back here and click below to get your results</div>' +
+      '<div style="font-size:13px;color:var(--muted);margin-bottom:12px">After you complete payment, come back here and click below to unlock results.</div>' +
       '<button class="btn-full" onclick="processPayment()">I\'ve completed payment →</button>' +
     '</div>' +
     '<button class="btn-back" onclick="renderStep1()">← Back to details</button>'
@@ -1416,29 +1460,33 @@ function renderStep2() {
 
 function processPayment() {
   var btn = document.querySelector('.btn-full');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Processing…'; }
-  
-  // Save order to database
+  if (btn) { btn.disabled = true; btn.innerHTML = '<div class="spin"></div> Creating order…'; }
+
   var buttonId = SERVICE_BUTTONS[activeService];
   fetch('/api/orders', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({service: activeService, button_id: buttonId, payload: formPayload})
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      service: activeService,
+      button_id: buttonId,
+      price_usd: SERVICE_PRICES[activeService],
+      payload: formPayload
+    })
   })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) throw new Error(data.error);
-    // Now generate the results
-    if (activeService === 'resume_ai') {
-      generateAIResume();
-    } else {
-      generateResult();
-    }
-  })
-  .catch(function(err) {
-    if (btn) { btn.disabled = false; btn.textContent = 'I\'ve completed payment →'; }
-    alert('Error: ' + err.message);
-  });
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) throw new Error(data.error);
+      currentOrderId = data.order_id;
+      if (activeService === 'resume_ai') {
+        generateAIResume();
+      } else {
+        generateResult();
+      }
+    })
+    .catch(function (err) {
+      if (btn) { btn.disabled = false; btn.textContent = 'I\'ve completed payment →'; }
+      alert('Error: ' + err.message);
+    });
 }
 
 function generateAIResume() {
@@ -1447,19 +1495,19 @@ function generateAIResume() {
 
   fetch('/api/generate', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(formPayload)
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ order_id: currentOrderId }, formPayload))
   })
-  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
-  .then(function(res) {
-    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
-    aiResult = res.data;
-    renderStep3({ai_result: res.data});
-  })
-  .catch(function(err) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateAIResume; }
-    alert('Generation failed: ' + err.message);
-  });
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+    .then(function (res) {
+      if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
+      aiResult = res.data;
+      renderStep3({ ai_result: res.data });
+    })
+    .catch(function (err) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateAIResume; }
+      alert('Generation failed: ' + err.message);
+    });
 }
 
 function generateResult() {
@@ -1468,18 +1516,18 @@ function generateResult() {
 
   fetch('/api/generate-result', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({service: activeService, payload: formPayload})
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ service: activeService, order_id: currentOrderId, payload: formPayload })
   })
-  .then(function(r) { return r.json().then(function(data){ return {ok: r.ok, data: data}; }); })
-  .then(function(res) {
-    if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
-    renderStep3(res.data);
-  })
-  .catch(function(err) {
-    if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateResult; }
-    alert('Generation failed: ' + err.message);
-  });
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+    .then(function (res) {
+      if (!res.ok || res.data.error) throw new Error(res.data.error || 'Generation failed');
+      renderStep3(res.data);
+    })
+    .catch(function (err) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; btn.onclick = generateResult; }
+      alert('Generation failed: ' + err.message);
+    });
 }
 
 // ─────────────────────────────────────────────
@@ -1492,24 +1540,28 @@ function downloadPDF() {
 
   fetch('/api/pdf', {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({name: formPayload.name || 'Candidate', resume: aiResult.resume, cover_letter: aiResult.cover_letter})
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: (formPayload && formPayload.name) || 'Candidate',
+      resume: aiResult.resume,
+      cover_letter: aiResult.cover_letter
+    })
   })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    if (data.error) throw new Error(data.error);
-    var a = document.createElement('a');
-    a.href = '/api/download/' + encodeURIComponent(data.filename);
-    a.download = data.filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download PDF'; }
-  })
-  .catch(function(err) {
-    alert('PDF download failed: ' + err.message);
-    if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download PDF'; }
-  });
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.error) throw new Error(data.error);
+      var a = document.createElement('a');
+      a.href = '/api/download/' + encodeURIComponent(data.filename);
+      a.download = data.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download PDF'; }
+    })
+    .catch(function (err) {
+      alert('PDF download failed: ' + err.message);
+      if (btn) { btn.disabled = false; btn.innerHTML = '📄 Download PDF'; }
+    });
 }
 
 // ─────────────────────────────────────────────
@@ -1520,7 +1572,7 @@ function renderStep3(result) {
   var content = '';
 
   if (activeService === 'resume_ai') {
-    content = result && result.ai_result ? renderAIResult(result.ai_result) : '<div class="err-box"><span>⚠</span><span>Could not load AI result.</span></div>';
+    content = result && result.ai_result ? renderAIResult(result.ai_result) : '<div class="err-box">Could not load AI result.</div>';
   } else if (activeService === 'resume_optimizer') {
     content = renderResumeResult(result);
   } else if (activeService === 'interview') {
@@ -1556,25 +1608,19 @@ function renderAIResult(result) {
 }
 
 function renderResumeResult(r) {
-  if (!r) return '<div class="err-box"><span>⚠</span><span>Results unavailable.</span></div>';
+  if (!r) return '<div class="err-box">Results unavailable.</div>';
   var score = r.ats_score || 0;
   var grade = r.grade || 'D';
   var gc    = grade === 'A' ? '#34d399' : grade === 'B' ? '#e6b44a' : '#f87171';
   var C     = 2 * Math.PI * 30;
   var dash  = C * (score / 100);
 
-  var sugs = (r.suggestions || []).map(function(s) {
+  var sugs = (r.suggestions || []).map(function (s) {
     return '<div class="sug-item"><div class="sev-dot sev-' + escHtml(s.severity) + '"></div><div class="sug-text">' + escHtml(s.message) + '</div></div>';
   }).join('');
 
-  var found = (r.found_keywords || []).map(function(k) {
-    return '<span class="kw">' + escHtml(k) + '</span>';
-  }).join('');
-
-  var miss = (r.missing_keywords || []).map(function(k) {
-    return '<span class="kw miss">' + escHtml(k) + '</span>';
-  }).join('');
-
+  var found = (r.found_keywords || []).map(function (k) { return '<span class="kw">' + escHtml(k) + '</span>'; }).join('');
+  var miss  = (r.missing_keywords || []).map(function (k) { return '<span class="kw miss">' + escHtml(k) + '</span>'; }).join('');
   var scoreLabel = score >= 85 ? 'Excellent ATS score!' : score >= 70 ? 'Good — apply suggestions below.' : 'Needs improvement.';
 
   return '<div class="rsec">' +
@@ -1597,43 +1643,47 @@ function renderResumeResult(r) {
 }
 
 function renderInterviewResult(r) {
-  if (!r) return '<div class="err-box"><span>⚠</span><span>Results unavailable.</span></div>';
+  if (!r) return '<div class="err-box">Results unavailable.</div>';
   var qs = r.questions || {};
-  var sections = [{label:'Technical', key:'technical'}, {label:'Behavioural', key:'behavioral'}, {label:'Situational', key:'situational'}];
+  var sections = [
+    { label: 'Technical',   key: 'technical'   },
+    { label: 'Behavioural', key: 'behavioral'  },
+    { label: 'Situational', key: 'situational' }
+  ];
 
-  var qHtml = sections.map(function(s) {
-    var items = (qs[s.key] || []).map(function(q, i) {
-      return '<div class="q-card"><div class="qn">Q' + (i+1) + '</div><div>' + escHtml(q) + '</div></div>';
+  var qHtml = sections.map(function (s) {
+    var items = (qs[s.key] || []).map(function (q, i) {
+      return '<div class="q-card"><div class="qn">Q' + (i + 1) + '</div><div>' + escHtml(q) + '</div></div>';
     }).join('');
     return '<div class="rsec"><div class="rsec-title">' + s.label + ' Questions</div>' + items + '</div>';
   }).join('');
 
   var se = r.star_example || {};
-  var starCells = ['situation','task','action','result'].map(function(k) {
+  var starCells = ['situation', 'task', 'action', 'result'].map(function (k) {
     return '<div class="star-cell"><div class="star-k">' + k.charAt(0).toUpperCase() + k.slice(1) + '</div><div class="star-v">' + escHtml(se[k] || '') + '</div></div>';
   }).join('');
 
-  var tips = (r.prep_tips || []).map(function(t) {
+  var tips = (r.prep_tips || []).map(function (t) {
     return '<div class="q-card"><div class="qn">💡</div><div>' + escHtml(t) + '</div></div>';
   }).join('');
 
   return qHtml +
-         '<div class="rsec"><div class="rsec-title">STAR Method Example Answer</div>' +
-           '<div class="star-grid">' + starCells + '</div>' +
-           (se.tip ? '<div class="tip-box"><span>💡</span><span>' + escHtml(se.tip) + '</span></div>' : '') +
-         '</div>' +
-         '<div class="rsec"><div class="rsec-title">Preparation Tips</div>' + tips + '</div>';
+    '<div class="rsec"><div class="rsec-title">STAR Method Example Answer</div>' +
+      '<div class="star-grid">' + starCells + '</div>' +
+      (se.tip ? '<div class="tip-box"><span>💡</span><span>' + escHtml(se.tip) + '</span></div>' : '') +
+    '</div>' +
+    '<div class="rsec"><div class="rsec-title">Preparation Tips</div>' + tips + '</div>';
 }
 
 function renderSalaryResult(r) {
-  if (!r) return '<div class="err-box"><span>⚠</span><span>Results unavailable.</span></div>';
+  if (!r) return '<div class="err-box">Results unavailable.</div>';
   var range   = r.range || {};
   var floor   = range.floor   || 0;
   var target  = range.target  || 0;
   var stretch = range.stretch || 0;
   var maxV    = stretch || 1;
 
-  var scripts = (r.scripts || []).map(function(s) {
+  var scripts = (r.scripts || []).map(function (s) {
     return '<div class="script-block">' + escHtml(s) + '</div>';
   }).join('');
 
@@ -1684,7 +1734,10 @@ def not_found(e):
 @app.get("/api/services")
 @limiter.limit("30 per minute")
 def api_services():
-    return jsonify(SERVICES)
+    return jsonify({
+        "services": SERVICES,
+        "accepted_coins": ACCEPTED_COINS,
+    })
 
 @app.post("/api/email-capture")
 def email_capture():
@@ -1695,9 +1748,7 @@ def email_capture():
     if not email or "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"error": "Valid email required"}), 400
 
-    result = {}
-    if resume:
-        result = run_resume_optimizer(resume, "Professional", "tech")
+    result = run_resume_optimizer(resume, "Professional", "tech") if resume else {}
 
     save_email_lead(
         email=email,
@@ -1712,7 +1763,7 @@ def email_capture():
         "ats_score":        result.get("ats_score", 0),
         "grade":            result.get("grade", ""),
         "missing_keywords": result.get("missing_keywords", [])[:4],
-        "message":          "Score sent to " + email,
+        "message":          "Score saved for " + email,
     })
 
 @app.post("/api/upload-resume")
@@ -1720,20 +1771,15 @@ def upload_resume():
     email = (request.form.get("email") or "").strip().lower()
     if not email or "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"error": "Valid email required"}), 400
-
     if "resume_file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
-
     file_storage = request.files["resume_file"]
     if not file_storage or not file_storage.filename:
         return jsonify({"error": "No file uploaded"}), 400
-
     resume_text, err = extract_text_from_upload(file_storage)
     if err:
         return jsonify({"error": err}), 400
-
     result = run_resume_optimizer(resume_text, "Professional", "tech")
-
     save_email_lead(
         email=email,
         has_resume=True,
@@ -1741,47 +1787,53 @@ def upload_resume():
         grade=result.get("grade", ""),
         source="capture_band_upload",
     )
-
     return jsonify({
         "ok":               True,
         "ats_score":        result.get("ats_score", 0),
         "grade":            result.get("grade", ""),
         "missing_keywords": result.get("missing_keywords", [])[:4],
         "word_count":       result.get("word_count", 0),
-        "message":          "Score sent to " + email,
+        "message":          "Score saved for " + email,
     })
 
 @app.get("/api/emails")
 def list_emails():
     admin_secret = os.environ.get("ADMIN_SECRET", "")
     secret = request.args.get("secret", "")
-    if not admin_secret or secret != admin_secret:
+    if not admin_secret or not hmac.compare_digest(secret, admin_secret):
         return jsonify({"error": "Unauthorized"}), 401
     return jsonify({"count": count_emails(), "emails": list_all_emails()})
 
 @app.post("/api/orders")
 def create_order():
-    body = request.get_json(silent=True) or {}
-    service = (body.get("service") or "").strip()
-    button_id = (body.get("button_id") or "").strip()
-    payload = body.get("payload") or {}
+    body      = request.get_json(silent=True) or {}
+    service   = (body.get("service") or "").strip()
+    payload   = body.get("payload") or {}
 
     if service not in SERVICES:
         return jsonify({"error": f"Unknown service. Valid: {', '.join(SERVICES.keys())}"}), 400
 
-    order_id = secrets.token_urlsafe(12)
+    # Client can't override the price/button — those come from SERVICES.
+    button_id = SERVICES[service]["button_id"]
+    order_id  = secrets.token_urlsafe(12)
     db_create_order(order_id, service, button_id, payload)
-    
-    return jsonify({"order_id": order_id, "ok": True})
+    return jsonify({"order_id": order_id, "ok": True, "button_id": button_id, "price_usd": SERVICES[service]["price_usd"]})
 
 @app.post("/api/generate-result")
 def generate_result():
-    body = request.get_json(silent=True) or {}
-    service = (body.get("service") or "").strip()
-    payload = body.get("payload") or {}
+    body      = request.get_json(silent=True) or {}
+    service   = (body.get("service") or "").strip()
+    payload   = body.get("payload") or {}
+    order_id  = (body.get("order_id") or "").strip()
 
     if service not in SERVICES:
         return jsonify({"error": "Invalid service"}), 400
+
+    # An order must exist. This prevents pure free-for-all access.
+    if order_id:
+        order = db_get_order(order_id)
+        if not order or order["service"] != service:
+            return jsonify({"error": "Order not found for this service."}), 400
 
     try:
         if service == "resume_optimizer":
@@ -1808,32 +1860,43 @@ def generate_result():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    if order_id:
+        db_update_order_status(order_id, "generated", result)
     return jsonify(result)
 
 @app.post("/api/generate")
 def generate():
-    body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    skills = (body.get("skills") or "").strip()
-    job_desc = (body.get("job_desc") or "").strip()
+    body      = request.get_json(silent=True) or {}
+    name      = (body.get("name") or "").strip()
+    skills    = (body.get("skills") or "").strip()
+    job_desc  = (body.get("job_desc") or "").strip()
+    order_id  = (body.get("order_id") or "").strip()
 
     if not name:   return jsonify({"error": "Name is required"}), 400
     if not skills: return jsonify({"error": "Skills are required"}), 400
 
+    if order_id:
+        order = db_get_order(order_id)
+        if not order or order["service"] not in ("resume_ai", "resume_optimizer"):
+            return jsonify({"error": "Order not found for AI resume generation."}), 400
+
     try:
         resume_text = call_claude(build_resume_prompt(name, skills, job_desc))
-        cover_text = call_claude(build_cover_letter_prompt(name, skills, job_desc, resume_text))
+        cover_text  = call_claude(build_cover_letter_prompt(name, skills, job_desc, resume_text))
     except Exception as e:
         return jsonify({"error": f"AI generation failed: {str(e)}"}), 500
 
-    return jsonify({"resume": resume_text, "cover_letter": cover_text})
+    out = {"resume": resume_text, "cover_letter": cover_text}
+    if order_id:
+        db_update_order_status(order_id, "generated", out)
+    return jsonify(out)
 
 @app.post("/api/pdf")
 def create_pdf():
-    body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "Candidate").strip()
+    body        = request.get_json(silent=True) or {}
+    name        = (body.get("name") or "Candidate").strip()
     resume_text = (body.get("resume") or "").strip()
-    cover_text = (body.get("cover_letter") or "").strip()
+    cover_text  = (body.get("cover_letter") or "").strip()
 
     if not resume_text:
         return jsonify({"error": "Resume content is required"}), 400
@@ -1847,20 +1910,25 @@ def create_pdf():
 
 @app.get("/api/download/<filename>")
 def download_file(filename):
-    safe = re.sub(r"[^a-zA-Z0-9_\-.]", "", filename)
-    if not safe.endswith(".pdf"):
+    # Strict allowlist: must match the exact generated pattern, no '..' possible.
+    if not re.fullmatch(r"careerforge_[a-zA-Z0-9_\-]{1,80}_[a-f0-9]{6}\.pdf", filename):
         return jsonify({"error": "Invalid filename"}), 400
-    filepath = OUTPUTS_DIR / safe
-    if not filepath.exists():
+    filepath = OUTPUTS_DIR / filename
+    try:
+        resolved = filepath.resolve()
+        if resolved.parent != OUTPUTS_DIR.resolve():
+            return jsonify({"error": "Invalid filename"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid filename"}), 400
+    if not resolved.exists():
         return jsonify({"error": "File not found. Please regenerate."}), 404
-    return send_file(str(filepath), as_attachment=True, download_name=safe, mimetype="application/pdf")
+    return send_file(str(resolved), as_attachment=True, download_name=filename, mimetype="application/pdf")
 
 @app.get("/health")
 def health():
+    # Do NOT leak email/order counts publicly. Only report boolean config flags.
     return jsonify({
         "status": "ok",
-        "orders": count_orders(),
-        "emails": count_emails(),
         "ai_generation_configured": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
     })
 
@@ -1931,7 +1999,7 @@ def catch_all(path):
         return jsonify({"error": "Not found"}), 404
     return FRONTEND_HTML
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print()
     print("─" * 60)
@@ -1942,11 +2010,8 @@ if __name__ == "__main__":
     else:
         print("  AI resume generation: NOT CONFIGURED — set ANTHROPIC_API_KEY")
     print("─" * 60)
+    print("  One-time crypto pricing (USDT / BTC / ETH / SOL):")
     for svc, info in SERVICES.items():
-        print(f"    • {info['name']} (${info['price_usd']})")
-    print("─" * 60)
-    print("  Payment buttons (NOWPayments, no API key required):")
-    for svc, info in SERVICES.items():
-        print(f"    • {info['name']}: iid={info['button_id']}")
+        print(f"    • {info['name']}: ${info['price_usd']} (iid={info['button_id']})")
     print("─" * 60)
     app.run(debug=False, host="0.0.0.0", port=5000)
